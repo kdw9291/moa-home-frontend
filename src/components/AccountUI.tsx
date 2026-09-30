@@ -122,7 +122,7 @@ function ConflictDialog() {
 }
 
 export function AccountMenu() {
-  const { ready, user, openLogin, signOut } = useSession();
+  const { ready, user, openLogin, signOut, pushWarning, dismissPushWarning } = useSession();
   const [busy, setBusy] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
   const uid = user?.id ?? null;
@@ -146,6 +146,12 @@ export function AccountMenu() {
       >
         로그아웃
       </button>
+      {pushWarning && (
+        <div role="alert" className="absolute right-4 top-14 z-30 w-72 rounded-lg border border-amber-300 bg-warn-bg p-3 text-xs text-warn shadow">
+          <p>계정이 바뀌는 동안 이 기기의 이전 계정 알림 구독을 해제하지 못했습니다. 이 기기에서 이전 계정의 알림이 계속 올 수 있으니 브라우저 설정에서 이 사이트의 알림을 꺼 주세요.</p>
+          <button className="mt-2 rounded border border-amber-400 px-2 py-1 font-semibold" onClick={dismissPushWarning}>확인</button>
+        </div>
+      )}
       {signOutError && (
         <div role="alert" className="absolute right-4 top-14 z-30 w-72 rounded-lg border border-amber-300 bg-warn-bg p-3 text-xs text-warn shadow">
           <p>{signOutError}</p>

@@ -10,6 +10,8 @@ interface SessionState {
   user: { id: string; email: string | null } | null;
   bookmarkIds: Set<string>;
   bookmarksLoaded: boolean;
+  pushWarning: boolean; // 계정이 바뀌는 중 이 기기의 이전 계정 푸시 구독을 해제하지 못했다(사용자에게 알림)
+  dismissPushWarning: () => void;
   pushEpoch: number; // 이 기기의 푸시 구독을 로그아웃 절차가 바꿨을 때 증가: 알림 설정 화면이 상태를 다시 읽는다
   loginOpen: boolean;
   loginReason: string | null;
@@ -33,23 +35,33 @@ export const useSession = create<SessionState>((set, get) => {
     set({ bookmarkIds: new Set((data ?? []).map((r: { announcement_id: string }) => r.announcement_id)), bookmarksLoaded: true });
   }
 
-  function apply(session: { user: { id: string; email?: string | null } } | null) {
+  type AuthSession = { user: { id: string; email?: string | null } } | null;
+  let applyChain: Promise<void> = Promise.resolve(); // 인증 상태 변경 처리를 순서대로 실행한다(푸시 해제를 기다리는 동안 다음 변경이 끼어들지 않게)
+
+  async function applyNow(session: AuthSession) {
     const id = session?.user.id ?? null;
     if (id === (get().user?.id ?? null)) {
       if (!get().ready) set({ ready: true });
       return;
     }
-    generation += 1;
     const prev = get().user?.id ?? null;
     if (prev && prev !== id) {
-      // 세션이 signOut 절차를 거치지 않고 바뀌어도(다른 탭의 로그아웃·계정 교체) 이 기기가 이전 계정의 알림을 계속 받지 않게 한다
-      void disablePush().catch(() => undefined);
-      set({ pushEpoch: get().pushEpoch + 1 });
+      // 세션이 signOut 절차를 거치지 않고 바뀌어도(다른 탭의 로그아웃·계정 교체) 이 기기가 이전 계정의 알림을 계속 받지 않게
+      // 한다. 해제를 기다리고 결과를 확인해, 실패하면 사용자에게 알린다(새 계정 세션 아래에서는 서버의 이전 행을 지울 수 없어
+      // 브라우저 구독 해제가 실제로 알림 수신을 멈추는 쪽이다).
+      const r = await disablePush().catch(() => ({ browser: false, server: false }));
+      set({ pushEpoch: get().pushEpoch + 1, pushWarning: !r.browser });
     }
+    generation += 1;
     // 이전 사용자의 데이터 제거 후 새 사용자로 전환
     set({ user: session ? { id: session.user.id, email: session.user.email ?? null } : null, bookmarkIds: new Set(), bookmarksLoaded: false, ready: true, loginOpen: false });
     void onUserChanged(id);
     if (id) void loadBookmarks(id);
+  }
+
+  function apply(session: AuthSession): Promise<void> {
+    applyChain = applyChain.then(() => applyNow(session)).catch(() => undefined);
+    return applyChain;
   }
 
   return {
@@ -58,6 +70,8 @@ export const useSession = create<SessionState>((set, get) => {
     bookmarkIds: new Set(),
     bookmarksLoaded: false,
     pushEpoch: 0,
+    pushWarning: false,
+    dismissPushWarning: () => set({ pushWarning: false }),
     loginOpen: false,
     loginReason: null,
     init: () => {
@@ -90,7 +104,7 @@ export const useSession = create<SessionState>((set, get) => {
       set({ pushEpoch: get().pushEpoch + 1 }); // 알림 설정 화면이 이 기기의 구독 상태(이미 해제됨)를 다시 읽게 한다
       const { error } = await supabase.auth.signOut();
       if (error) return "로그아웃하지 못했습니다. 이 기기의 알림은 이미 꺼졌으니 필요하면 관심 공고 화면에서 다시 켜 주세요. 네트워크를 확인하고 로그아웃을 다시 시도해 주세요.";
-      apply(null);
+      await apply(null);
       return null;
     },
     toggleBookmark: async (announcementId) => {
