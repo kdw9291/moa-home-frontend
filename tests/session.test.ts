@@ -33,7 +33,8 @@ vi.mock("@/lib/supabase", () => ({
   },
 }));
 const pushResult = { browser: true, server: true };
-vi.mock("@/lib/pushClient", () => ({ disablePush: () => { state.calls.push("disablePush"); return Promise.resolve({ ...pushResult }); } }));
+const pushDelay = { ms: 0 };
+vi.mock("@/lib/pushClient", () => ({ disablePush: () => { state.calls.push("disablePush"); return new Promise((r) => setTimeout(() => r({ ...pushResult }), pushDelay.ms)); } }));
 const onUserChanged = vi.fn((_id: string | null) => Promise.resolve());
 vi.mock("@/store/account", () => ({ onUserChanged: (id: string | null) => onUserChanged(id) }));
 
@@ -48,6 +49,7 @@ async function fresh() {
 
 beforeEach(() => {
   pushResult.browser = true;
+  pushDelay.ms = 0;
   pushResult.server = true;
   state.authListener = null;
   state.session = null;
@@ -199,5 +201,31 @@ describe("세션과 북마크", () => {
     const useSession = await fresh();
     expect((await useSession.getState().sendMagicLink("not-an-email")).ok).toBe(false);
     expect((await useSession.getState().sendMagicLink("me@example.com")).ok).toBe(true);
+  });
+
+  it("푸시 해제 응답이 늦어도 이전 계정의 화면 데이터는 즉시 비워진다", async () => {
+    const useSession = await fresh();
+    state.session = sess("A");
+    useSession.getState().init();
+    await tick();
+    expect(useSession.getState().user?.id).toBe("A");
+    pushDelay.ms = 200;
+    state.authListener!("SIGNED_IN", sess("B"));
+    await tick(30);                                              // 해제는 아직 끝나지 않음
+    expect(useSession.getState().user?.id).toBe("B");
+    expect(useSession.getState().bookmarkIds.size).toBe(0);
+    await tick(250);
+    expect(useSession.getState().pushWarning).toBe(false);
+  });
+
+  it("다른 탭 로그아웃으로 비로그인이 돼도 푸시 해제에 실패하면 경고 상태가 켜진다", async () => {
+    const useSession = await fresh();
+    state.session = sess("A");
+    useSession.getState().init();
+    await tick();
+    pushResult.browser = false;
+    state.authListener!("SIGNED_OUT", null);
+    await tick(60);
+    expect(useSession.getState()).toMatchObject({ user: null, pushWarning: true });
   });
 });

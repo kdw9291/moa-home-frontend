@@ -298,6 +298,53 @@ describe("계정 동기화: 경합·실패 경로", () => {
   });
 });
 
+describe("계정 동기화: 재리뷰 #3 보완", () => {
+  it("충돌창에서 '내 조건'을 골랐는데 저장이 실패해도 새로고침 뒤 같은 계정이면 그 조건을 복구한다", async () => {
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    store["moahome.prefs.v1"] = JSON.stringify({ filters: { budgetMaxKrw: 300_000_000 }, tab: "open", sort: "latest" });
+    const first = await fresh();
+    await first.onUserChanged("A");                              // 로컬 300M vs 서버 500M -> 선택창
+    db.failUpsert = true;
+    await first.resolveConflict("local");                        // 저장 실패
+    await tick();
+    expect(first.usePrefs.getState().saveStatus).toBe("error");
+    // 계정 모드에서 바뀐 조건은 비회원 저장 키가 아니라 사용자 전용 복구 사본에 남는다
+    delete store["moahome.prefs.v1"];
+    expect(store["moahome.pending.v1"]).toContain("300000000");
+    db.failUpsert = false;
+    const reloaded = await fresh();                              // 새로고침
+    await reloaded.onUserChanged("A");
+    await tick();
+    expect(reloaded.usePrefs.getState().conflict).toMatchObject({ local: { budgetMaxKrw: 300_000_000 }, server: { budgetMaxKrw: 500_000_000 } });   // 잃지 않고 다시 선택하게 한다
+  });
+
+  it("복구 사본은 다른 계정에 섞이지 않고 로그아웃하면 지워진다", async () => {
+    store["moahome.pending.v1"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
+    db.serverRows["B"] = serverRow("B", 700_000_000);
+    const { usePrefs, onUserChanged } = await fresh();
+    await onUserChanged("B");
+    await tick();
+    expect(usePrefs.getState().filters.budgetMaxKrw).toBe(700_000_000);
+    expect(usePrefs.getState().conflict).toBeNull();
+    await onUserChanged(null);
+    expect(store["moahome.pending.v1"]).toBeUndefined();
+  });
+
+  it("조회를 기다리는 동안 바꾼 조건은 응답이 와도 서버 값에 덮이지 않고 선택창으로 간다", async () => {
+    const { usePrefs, onUserChanged } = await fresh();
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    db.holdGet = true;
+    const pending = onUserChanged("A");
+    await tick();
+    usePrefs.getState().setFilters({ budgetMaxKrw: 123_000_000 });
+    db.releaseGet!();
+    await pending;
+    await tick();
+    expect(usePrefs.getState().conflict).toMatchObject({ local: { budgetMaxKrw: 123_000_000 }, server: { budgetMaxKrw: 500_000_000 } });
+    expect(usePrefs.getState().filters.budgetMaxKrw).toBe(123_000_000);
+  });
+});
+
 // 타입 확인용(사용하지 않음): Filters 형태가 바뀌면 컴파일 단계에서 알 수 있게 한다
 const _shape: Pick<Filters, "budgetMaxKrw"> = { budgetMaxKrw: null };
 void _shape;

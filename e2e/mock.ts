@@ -161,7 +161,8 @@ export async function installMock(page: Page, opts: MockOptions = {}): Promise<M
     }
     const sub = opts.auth?.userId ?? "";
     // RLS 흉내(user_id = auth.uid()): 조회 조건·쓰기 본문의 user_id가 토큰 사용자와 다르면 거부한다.
-    const scopedUid = userTable && method !== "GET" ? (() => { try { return (route.request().postDataJSON() as { user_id?: string } | null)?.user_id; } catch { return undefined; } })() : undefined;
+    const writesBody = userTable && (method === "POST" || method === "PATCH" || method === "PUT");
+    const scopedUid = writesBody ? (() => { try { return (route.request().postDataJSON() as { user_id?: string } | null)?.user_id ?? ""; } catch { return ""; } })() : undefined;
     if (userTable && scopedUid !== undefined && scopedUid !== sub) return json(route, { code: "42501", message: "new row violates row-level security policy" }, 403);
     if (userTable && method === "GET") {
       const q = url.searchParams.get("user_id")?.replace(/^eq\./, "");
