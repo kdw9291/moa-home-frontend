@@ -128,8 +128,19 @@ export function AccountMenu() {
   const uid = user?.id ?? null;
   useEffect(() => setSignOutError(null), [uid]); // 계정이 바뀌면 이전 계정의 로그아웃 오류·강제 로그아웃 버튼을 없앤다
   if (!ready) return <span className="h-8 w-16" aria-hidden />;
+  const pushAlert = pushWarning && (
+    <div role="alert" className="absolute right-4 top-14 z-30 w-72 rounded-lg border border-amber-300 bg-warn-bg p-3 text-xs text-warn shadow">
+      <p>계정이 바뀌는 동안 이 기기의 이전 계정 알림 구독을 해제하지 못했습니다. 이 기기에서 이전 계정의 알림이 계속 올 수 있으니 브라우저 설정에서 이 사이트의 알림을 꺼 주세요.</p>
+      <button className="mt-2 rounded border border-amber-400 px-2 py-1 font-semibold" onClick={dismissPushWarning}>확인</button>
+    </div>
+  );
   if (!user) {
-    return <button onClick={() => openLogin()} className="rounded-md border border-line px-3 py-1.5 text-sm font-semibold text-brand">로그인</button>;
+    return (
+      <>
+        <button onClick={() => openLogin()} className="rounded-md border border-line px-3 py-1.5 text-sm font-semibold text-brand">로그인</button>
+        {pushAlert}
+      </>
+    );
   }
   return (
     <div className="flex items-center gap-2 text-sm">
@@ -146,12 +157,7 @@ export function AccountMenu() {
       >
         로그아웃
       </button>
-      {pushWarning && (
-        <div role="alert" className="absolute right-4 top-14 z-30 w-72 rounded-lg border border-amber-300 bg-warn-bg p-3 text-xs text-warn shadow">
-          <p>계정이 바뀌는 동안 이 기기의 이전 계정 알림 구독을 해제하지 못했습니다. 이 기기에서 이전 계정의 알림이 계속 올 수 있으니 브라우저 설정에서 이 사이트의 알림을 꺼 주세요.</p>
-          <button className="mt-2 rounded border border-amber-400 px-2 py-1 font-semibold" onClick={dismissPushWarning}>확인</button>
-        </div>
-      )}
+      {pushAlert}
       {signOutError && (
         <div role="alert" className="absolute right-4 top-14 z-30 w-72 rounded-lg border border-amber-300 bg-warn-bg p-3 text-xs text-warn shadow">
           <p>{signOutError}</p>

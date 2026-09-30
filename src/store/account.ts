@@ -81,6 +81,36 @@ function readLocalFilters(): Filters | null {
   }
 }
 
+// 저장에 실패한 계정 조건의 복구 사본. 비회원 저장 키와 분리하고 사용자 id를 붙여, 다른 계정에 섞이지 않게 한다.
+const PENDING_KEY = "moahome.pending.v1";
+
+function writePending(userId: string) {
+  try {
+    window.localStorage.setItem(PENDING_KEY, JSON.stringify({ userId, filters: usePrefs.getState().filters }));
+  } catch {
+    /* 무시 */
+  }
+}
+
+function readPending(userId: string): Filters | null {
+  try {
+    const raw = window.localStorage.getItem(PENDING_KEY);
+    if (!raw) return null;
+    const p = JSON.parse(raw) as { userId?: string; filters?: unknown };
+    return p.userId === userId ? sanitizePrefs({ filters: p.filters }).filters : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPending() {
+  try {
+    window.localStorage.removeItem(PENDING_KEY);
+  } catch {
+    /* 무시 */
+  }
+}
+
 function clearLocal() {
   try {
     window.localStorage.removeItem(PREFS_KEY);
@@ -142,6 +172,10 @@ function saveLatest(userId: string, gen: number): Promise<SaveResult> {
 function reportSave(gen: number, r: SaveResult) {
   if (r === "ignored" || stale(gen)) return;
   usePrefs.getState().setSaveStatus(r);
+  if (currentUser) {
+    if (r === "saved") clearPending();
+    else if (r === "error") writePending(currentUser); // 새로고침해도 저장 못 한 조건을 잃지 않게(같은 계정일 때만 복구)
+  }
 }
 
 /** 저장 실패 뒤 사용자가 누르는 '다시 저장': 현재 필터를 같은 경로로 다시 저장한다. */
@@ -214,17 +248,27 @@ export async function onUserChanged(userId: string | null, opts: { localOverride
   const gen = epoch;
   revision = 0;
   if (!userId) {
-    if (hadUser) usePrefs.getState().resetToGuest();
+    if (hadUser) {
+      usePrefs.getState().resetToGuest();
+      clearPending(); // 로그아웃하면 이 브라우저에 남은 저장 못 한 조건도 지운다
+    }
     return;
   }
-  if (hadUser) usePrefs.getState().resetToGuest(); // 계정 전환: 이전 계정의 필터가 섞이지 않게 먼저 비운다
+  if (hadUser) {
+    usePrefs.getState().resetToGuest(); // 계정 전환: 이전 계정의 필터가 섞이지 않게 먼저 비운다
+    clearPending();
+  }
   if (!supabase) return;
   usePrefs.getState().setSaveStatus("idle");
   usePrefs.getState().setSyncing(true); // 동기화 중에는 비회원 저장 훅이 브라우저에 쓰지 않는다(prefs.ts)
   try {
-    const local = hadUser ? null : (opts.localOverride ?? readLocalFilters());
+    let local = hadUser ? null : (opts.localOverride ?? readPending(userId) ?? readLocalFilters());
+    const startSnap = JSON.stringify(usePrefs.getState().filters);
     const server = await fetchServer(userId);
     if (stale(gen)) return; // 조회 중 계정이 바뀜(같은 사용자로 되돌아온 경우 포함)
+    // 조회를 기다리는 동안 사용자가 조건을 바꿨다면 그 값을 '로컬 후보'로 삼아 서버 값에 덮이지 않게 한다.
+    const live = usePrefs.getState().filters;
+    if (JSON.stringify(live) !== startSnap) local = live;
     revision = server?.revision ?? 0;
     const d = decideFilterSync(local, server?.filters ?? null);
     const p = usePrefs.getState();
