@@ -21,6 +21,10 @@ const enablePending = new Set<Promise<unknown>>();
 // 이 기기의 현재 브라우저 구독이 묶인 계정. 브라우저 구독을 만든 순간 기록하고, 해제하거나 그 구독을 만든 켜기가 실패할 때 비운다.
 // token은 켜기 요청마다 다른 값이라, 같은 계정의 이전 요청이 실패해도 최신 구독의 기록을 지우지 않는다.
 let subOwner: { userId: string; token: number } | null = null;
+// 해제(로그아웃·계정 전환 정리)가 실제로 수행될 때마다 증가. 켜기는 시작 때의 값을 기억해, 그 사이 해제가 있었다면(로그아웃 뒤에 끝나는 켜기)
+// 구독을 만들지 않거나 만든 구독을 되돌린다.
+let disableEpoch = 0;
+const CANCELLED: EnableResult = { ok: false, reason: "error", message: "로그아웃 또는 계정 전환으로 알림 켜기를 취소했습니다." };
 
 export async function enablePush(userId: string): Promise<EnableResult> {
   enableCount += 1;
@@ -69,12 +73,14 @@ export async function waitForPendingEnables(ms: number): Promise<boolean> {
 
 async function enablePushInner(userId: string, token: number): Promise<EnableResult> {
   if (!supabase) return { ok: false, reason: "error", message: "설정이 없어 알림을 켤 수 없습니다." };
+  const epochAtStart = disableEpoch;
   try {
     const permission = await Notification.requestPermission();
     if (permission === "denied") return { ok: false, reason: "denied", message: "브라우저에서 알림이 차단되어 있습니다. 브라우저 설정에서 허용한 뒤 다시 시도하세요." };
     if (permission !== "granted") return { ok: false, reason: "dismissed", message: "알림 허용을 선택하지 않아 켜지 않았습니다." };
     const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
     await navigator.serviceWorker.ready;
+    if (disableEpoch !== epochAtStart) return CANCELLED; // 기다리는 동안 로그아웃·정리가 있었다: 구독을 만들지 않는다
     await (await reg.pushManager.getSubscription())?.unsubscribe();
     const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToBytes(VAPID) });
     subOwner = { userId, token }; // 서버 등록 응답 순서가 아니라 브라우저 구독이 바뀐 순서대로 소유 계정을 기록한다
@@ -87,6 +93,12 @@ async function enablePushInner(userId: string, token: number): Promise<EnableRes
       await sub.unsubscribe();
       const taken = error.code === "42501" || error.code === "23505";
       throw new Error(taken ? "이 기기의 알림이 다른 계정에 연결되어 있습니다. 이전 계정에서 알림을 끄거나 로그아웃한 뒤 다시 시도하세요." : error.message);
+    }
+    if (disableEpoch !== epochAtStart) {
+      // 서버 등록까지 끝났지만 그 사이 로그아웃·정리가 있었다: 만든 구독과 서버 행을 되돌린다
+      await sub.unsubscribe().catch(() => false);
+      await supabase.from("push_subscriptions").delete().eq("endpoint", j.endpoint).then(() => undefined, () => undefined);
+      return CANCELLED;
     }
     return { ok: true };
   } catch (e) {
@@ -113,6 +125,7 @@ export async function disablePush(opts: { skipIfReenabled?: boolean; keepIfOwned
   if (!sub) return { browser: true, server: true };
   if (opts.keepIfOwnedBy && subOwner !== null && subOwner.userId === opts.keepIfOwnedBy()) return { browser: true, server: true }; // 지금 세션 계정의 구독이면 지우지 않는다
   if (opts.skipIfReenabled && (enableCount !== snap || enableInFlight > 0)) return { browser: true, server: true, skipped: true }; // 새 계정이 켜는 중이거나 켰다면 그 구독을 지우지 않는다
+  disableEpoch += 1; // 이 시점부터 이미 진행 중이던 켜기는 끝나도 구독을 남기지 못한다
   // 브라우저 구독을 먼저 해제한다: 이것이 이 기기의 알림 수신을 멈춘다
   const browser = await sub.unsubscribe().catch(() => false);
   if (browser) subOwner = null;
