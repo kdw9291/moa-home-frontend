@@ -1,6 +1,6 @@
 "use client";
 import { create } from "zustand";
-import { disablePreviousAccountPush, disablePush } from "@/lib/pushClient";
+import { disablePreviousAccountPush, disablePush, waitForPendingEnables } from "@/lib/pushClient";
 import { supabase } from "@/lib/supabase";
 import { onUserChanged } from "./account";
 
@@ -104,6 +104,7 @@ export const useSession = create<SessionState>((set, get) => {
       if (!supabase) return null;
       // 이 기기가 이전 계정의 알림을 계속 받지 않게 먼저 해제한다. 브라우저 구독을 해제하지 못하면
       // (force가 아닌 한) 로그아웃하지 않고 알려서, 다음 사용자가 이전 계정의 알림을 받는 일을 막는다.
+      await waitForPendingEnables(8000).catch(() => false); // 켜는 중이던 알림이 로그아웃 뒤에 구독을 남기지 않게 끝나길 기다린다(멈췄으면 시간 제한)
       const r = await disablePush().catch(() => ({ browser: false, server: false }));
       if (!r.browser && !force) {
         return "이 기기의 알림 구독을 해제하지 못해 로그아웃하지 않았습니다. 브라우저 설정에서 이 사이트의 알림을 끄고 다시 시도하세요. 그래도 로그아웃하면 이 기기가 이전 계정의 관심 공고 알림을 계속 받을 수 있습니다(같은 기기를 다른 사람이 쓸 경우 주의).";
