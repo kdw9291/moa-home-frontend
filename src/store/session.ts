@@ -1,6 +1,6 @@
 "use client";
 import { create } from "zustand";
-import { disablePush } from "@/lib/pushClient";
+import { disablePreviousAccountPush, disablePush } from "@/lib/pushClient";
 import { supabase } from "@/lib/supabase";
 import { onUserChanged } from "./account";
 
@@ -61,7 +61,7 @@ export const useSession = create<SessionState>((set, get) => {
       // (새 계정 세션 아래에서는 서버의 이전 행을 지울 수 없어 브라우저 구독 해제가 실제로 알림 수신을 멈추는 쪽이다).
       // applyChain 밖에서 실행해 연속 전환이 지연되지 않게 한다. 경고는 켜기만 하고(사용자가 닫을 때까지) 뒤 결과가 덮어 끄지 못한다.
       const limit = new Promise<{ browser: boolean }>((resolve) => setTimeout(() => resolve({ browser: false }), 10_000));
-      const r = await Promise.race([disablePush({ skipIfReenabled: true }).catch(() => ({ browser: false })), limit]);
+      const r = await Promise.race([disablePreviousAccountPush().catch(() => ({ browser: false })), limit]);
       set({ pushEpoch: get().pushEpoch + 1, pushWarning: get().pushWarning || !r.browser });
     }
   }

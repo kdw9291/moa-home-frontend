@@ -1,5 +1,5 @@
 // 계정 연동: 로그인 시 필터 동기화(로컬/서버 충돌은 사용자가 선택), 계정 모드 자동 저장, 로그아웃 시 개인 데이터 제거.
-import { decideFilterSync, filtersSavable, isDefaultFilters } from "@/lib/filtersync";
+import { decideFilterSync, filtersSavable, isDefaultFilters, sameFilters } from "@/lib/filtersync";
 import { supabase } from "@/lib/supabase";
 import type { Filters } from "@/lib/types";
 import { PREFS_KEY, sanitizePrefs, usePrefs } from "./prefs";
@@ -61,6 +61,7 @@ let currentUser: string | null = null;
 // 사용자가 바뀔 때마다 증가하는 세대 번호. 같은 사용자로 돌아와도(A→B→A) 이전 세대의 fetch·save 결과는 버린다.
 let epoch = 0;
 let revision = 0;
+let lastSaved: Filters | null = null; // 마지막으로 서버에 저장된 조건(저장 중 더 바뀌었는지 판단)
 let timer: ReturnType<typeof setTimeout> | null = null;
 let unsub: (() => void) | null = null;
 let queue: Promise<unknown> = Promise.resolve();
@@ -81,12 +82,12 @@ function readLocalFilters(): Filters | null {
   }
 }
 
-// 저장에 실패한 계정 조건의 복구 사본. 비회원 저장 키와 분리하고 사용자 id를 붙여, 다른 계정에 섞이지 않게 한다.
-const PENDING_KEY = "moahome.pending.v1";
+// 저장하지 못한 계정 조건의 복구 사본. 비회원 저장 키와 분리하고 계정마다 키를 따로 두어, 다른 계정에 섞이거나 서로 덮지 않게 한다.
+const pendingKey = (userId: string) => `moahome.pending.v2:${userId}`;
 
 function writePending(userId: string, filters: Filters = usePrefs.getState().filters) {
   try {
-    window.localStorage.setItem(PENDING_KEY, JSON.stringify({ userId, filters }));
+    window.localStorage.setItem(pendingKey(userId), JSON.stringify({ userId, filters }));
   } catch {
     /* 무시 */
   }
@@ -94,7 +95,7 @@ function writePending(userId: string, filters: Filters = usePrefs.getState().fil
 
 function readPending(userId: string): Filters | null {
   try {
-    const raw = window.localStorage.getItem(PENDING_KEY);
+    const raw = window.localStorage.getItem(pendingKey(userId));
     if (!raw) return null;
     const p = JSON.parse(raw) as { userId?: string; filters?: unknown };
     return p.userId === userId ? sanitizePrefs({ filters: p.filters }).filters : null;
@@ -103,18 +104,17 @@ function readPending(userId: string): Filters | null {
   }
 }
 
-/** owner의 복구 사본만 지운다(다른 계정의 사본은 그 계정이 돌아올 때까지 보존). */
-function clearPending(owner: string) {
+/**
+ * 그 계정의 복구 사본을 지운다. saved를 주면 '방금 저장된 값과 같은 사본'만 지운다
+ * (같은 계정의 다른 탭이 나중에 남긴 더 새로운 사본을 지우지 않는다).
+ */
+function clearPending(owner: string, saved?: Filters) {
   try {
-    const raw = window.localStorage.getItem(PENDING_KEY);
-    if (!raw) return;
-    let own = true;
-    try {
-      own = (JSON.parse(raw) as { userId?: string }).userId === owner;
-    } catch {
-      own = true; // 읽을 수 없는 사본은 정리한다
+    if (saved) {
+      const cur = readPending(owner);
+      if (cur && !sameFilters(cur, saved)) return;
     }
-    if (own) window.localStorage.removeItem(PENDING_KEY);
+    window.localStorage.removeItem(pendingKey(owner));
   } catch {
     /* 무시 */
   }
@@ -172,6 +172,7 @@ function saveLatest(userId: string, gen: number): Promise<SaveResult> {
     if (stale(gen)) return "ignored"; // 저장 중 계정이 바뀜: 새 세대의 개정 번호·상태를 건드리지 않는다
     if (error) return "error";
     revision = next;
+    lastSaved = f;
     return "saved";
   });
   queue = job.catch(() => undefined);
@@ -182,8 +183,12 @@ function reportSave(gen: number, r: SaveResult) {
   if (r === "ignored" || stale(gen)) return;
   usePrefs.getState().setSaveStatus(r);
   if (currentUser) {
-    if (r === "saved") clearPending(currentUser);
-    else if (r === "error" || r === "invalid") writePending(currentUser); // 새로고침해도 저장 못 한 조건을 잃지 않게(같은 계정일 때만 복구)
+    if (r === "saved") {
+      // 저장하는 사이 조건이 또 바뀌었다면 그 새 값은 아직 저장되지 않았으니 복구 사본으로 남기고, 아니면 저장된 값의 사본만 지운다
+      const cur = usePrefs.getState().filters;
+      if (lastSaved && !sameFilters(cur, lastSaved)) writePending(currentUser);
+      else clearPending(currentUser, lastSaved ?? undefined);
+    } else if (r === "error" || r === "invalid") writePending(currentUser); // 새로고침해도 저장 못 한 조건을 잃지 않게(같은 계정일 때만 복구)
   }
 }
 
@@ -197,9 +202,16 @@ export async function retrySave(): Promise<void> {
   if (r === "saved" && !stale(gen)) clearLocal(); // 서버에 저장됐으니 남겨 둔 로컬 사본을 정리
 }
 
-function startAutosave(userId: string, gen: number) {
+function startAutosave(userId: string, gen: number, baseline?: Filters) {
   unsub?.();
-  let last = JSON.stringify(usePrefs.getState().filters);
+  // baseline: 첫 저장에 실제로 쓴 값. 첫 저장을 기다리는 동안 더 바뀌었다면 그 차이를 바로 저장 대기열에 올린다.
+  let last = JSON.stringify(baseline ?? usePrefs.getState().filters);
+  const now = JSON.stringify(usePrefs.getState().filters);
+  if (now !== last) {
+    last = now;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => void saveLatest(userId, gen).then((r) => reportSave(gen, r)), 800);
+  }
   unsub = usePrefs.subscribe((s) => {
     if (s.mode !== "account" || s.syncing || s.conflict || stale(gen)) return;
     const cur = JSON.stringify(s.filters);
@@ -223,16 +235,19 @@ export async function resolveConflict(choice: "local" | "server"): Promise<void>
   // 선택이 끝났으니 비회원 저장본과 이전 복구 사본은 정리한다. 내 조건 저장이 실패하면 reportSave가 사용자 전용 복구 사본을 새로 남긴다
   // (비회원 저장 키는 다른 계정에 넘어갈 수 있어 계정 조건을 남기지 않는다).
   clearLocal();
+  let saved: Filters | undefined;
   if (choice === "local") {
     writePending(userId, chosen); // 저장이 끝나기 전에 탭이 닫혀도 선택한 조건을 잃지 않게 먼저 남기고, 저장 성공 때 지운다
-    reportSave(gen, await saveLatest(userId, gen));
+    const r = await saveLatest(userId, gen);
+    reportSave(gen, r);
+    if (r === "saved") saved = lastSaved ?? undefined;
   } else {
     clearPending(userId);
   }
   if (stale(gen)) return; // 저장 중 계정이 바뀜: 이전 계정의 필터를 적용하지 않는다
   setConflict(null);
   usePrefs.getState().setSyncing(false);
-  startAutosave(userId, gen);
+  startAutosave(userId, gen, saved);
 }
 
 /**
@@ -259,6 +274,7 @@ export async function onUserChanged(userId: string | null, opts: { localOverride
   epoch += 1;
   const gen = epoch;
   revision = 0;
+  lastSaved = null;
   if (!userId) {
     if (hadUser) {
       usePrefs.getState().resetToGuest();
@@ -277,12 +293,12 @@ export async function onUserChanged(userId: string | null, opts: { localOverride
     // 재시도 때 넘어온 화면 조건이 기본값이면 '바꾼 적 없음'으로 보고 복구 사본·비회원 저장본을 우선한다.
     const override = opts.localOverride && !isDefaultFilters(opts.localOverride) ? opts.localOverride : undefined;
     let local = hadUser ? null : (override ?? readPending(userId) ?? readLocalFilters());
-    const startSnap = JSON.stringify(usePrefs.getState().filters);
+    const startSnap = usePrefs.getState().filters;
     const server = await fetchServer(userId);
     if (stale(gen)) return; // 조회 중 계정이 바뀜(같은 사용자로 되돌아온 경우 포함)
     // 조회를 기다리는 동안 사용자가 조건을 바꿨다면 그 값을 '로컬 후보'로 삼아 서버 값에 덮이지 않게 한다.
     const live = usePrefs.getState().filters;
-    if (JSON.stringify(live) !== startSnap) local = live;
+    if (!sameFilters({ ...live, areaUnit: startSnap.areaUnit }, startSnap)) local = live;   // 표시 단위(㎡/평)만 바꾼 것은 조건 변경이 아니다
     revision = server?.revision ?? 0;
     const d = decideFilterSync(local, server?.filters ?? null);
     const p = usePrefs.getState();
@@ -296,14 +312,16 @@ export async function onUserChanged(userId: string | null, opts: { localOverride
     if (d.action === "keep" && server) p.applyFilters(server.filters);
     if (d.action !== "push-local") clearPending(userId); // 서버 값을 쓰는 경우 이전 복구 사본은 더 쓰지 않는다
     if (local) clearLocal(); // 계정 모드에서는 비회원 저장본에 필터를 남기지 않는다(실패한 저장은 사용자 전용 복구 사본이 맡는다)
+    let savedFirst: Filters | undefined;
     if (d.action === "push-local") {
       p.applyFilters(local!);
       writePending(userId, local!); // 저장이 끝나기 전 종료에 대비해 먼저 남기고, 성공 시 reportSave가 지운다
       const r = await saveLatest(userId, gen);
       if (stale(gen)) return; // 저장 중 계정이 바뀜
       reportSave(gen, r);
+      savedFirst = r === "saved" ? (lastSaved ?? undefined) : undefined;
     }
-    startAutosave(userId, gen);
+    startAutosave(userId, gen, savedFirst);
   } catch {
     if (!stale(gen)) {
       // 서버 조회 실패: 로그인 상태인데 비회원 저장 모드에 남으면 이후 변경이 브라우저에 쓰이므로 계정 모드로 전환한다
