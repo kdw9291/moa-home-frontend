@@ -8,6 +8,9 @@ const st = {
   hold: false,
   releases: [] as (() => void)[],
   n: 0,
+  calls: 0, // upsert 호출 번호(1부터)
+  failCalls: new Set<number>(), // 이 번호의 upsert는 실패시킨다
+  permGate: null as null | Promise<void>, // 권한 요청을 붙잡는다(브라우저 작업이 멈춘 상황)
 };
 // 붙잡아 둔 서버 등록 응답을 나중에 도착한 요청부터 풀어, 응답 순서와 구독 생성 순서가 어긋나는 상황을 만든다.
 const releaseAll = () => {
@@ -21,7 +24,9 @@ vi.mock("@/lib/supabase", () => ({
     from: () => ({
       upsert: () =>
         new Promise((res) => {
-          const done = () => res({ error: st.upsertError });
+          st.calls += 1;
+          const no = st.calls;
+          const done = () => res({ error: st.upsertError ?? (st.failCalls.has(no) ? { message: "fail" } : null) });
           if (st.hold) st.releases.push(done);
           else done();
         }),
@@ -48,6 +53,9 @@ beforeEach(() => {
   st.hold = false;
   st.releases = [];
   st.n = 0;
+  st.calls = 0;
+  st.failCalls = new Set();
+  st.permGate = null;
   st.subscription = mkSub("old-A");
   const reg = {
     pushManager: {
@@ -60,7 +68,7 @@ beforeEach(() => {
     },
   };
   vi.stubGlobal("navigator", { serviceWorker: { getRegistration: () => Promise.resolve(reg), register: () => Promise.resolve(reg), ready: Promise.resolve(reg) } });
-  vi.stubGlobal("Notification", { requestPermission: () => Promise.resolve("granted") });
+  vi.stubGlobal("Notification", { requestPermission: () => (st.permGate ?? Promise.resolve()).then(() => "granted") });
 });
 
 async function fresh() {
@@ -130,6 +138,45 @@ describe("이전 계정 푸시 정리와 새 계정 켜기의 경합", () => {
     await Promise.all([enableB, enableA]);
     const r = await push.disablePreviousAccountPush(() => "B"); // 세션은 B로 돌아왔다: A의 구독은 해제해야 한다
     expect(r.browser).toBe(true);
+    expect(st.subscription).toBeNull();
+  });
+
+  it("같은 계정의 이전 켜기가 늦게 실패해도 최신 구독의 소유 기록을 지우지 않는다", async () => {
+    const push = await fresh();
+    st.hold = true;
+    st.failCalls.add(1); // 첫 번째 켜기의 서버 등록만 실패한다
+    const first = push.enablePush("B");
+    await wait();
+    const second = push.enablePush("B"); // 두 번째가 만든 구독(new-2)이 현재 구독
+    await wait();
+    releaseAll(); // 두 번째 응답(성공)이 먼저, 첫 번째(실패)가 늦게 도착
+    expect((await first).ok).toBe(false);
+    expect((await second).ok).toBe(true);
+    await push.disablePreviousAccountPush(() => "B"); // 늦은 이전 계정 정리: B의 구독은 유지해야 한다
+    expect(st.subscription?.endpoint).toBe("new-2");
+  });
+
+  it("멈춘 켜기에 이전 계정 정리가 묶이지 않고 시간 제한 뒤 이전 구독을 해제한다", async () => {
+    const push = await fresh();
+    st.permGate = new Promise<void>(() => {}); // B의 권한 요청이 끝나지 않는다
+    void push.enablePush("B");
+    await wait();
+    const r = await push.disablePreviousAccountPush(() => "B", 60); // 대기 60ms 뒤 진행
+    expect(r.browser).toBe(true);
+    expect(st.subscription).toBeNull(); // 이전 계정(A)의 구독이 해제됐다
+  });
+
+  it("로그아웃 전 진행 중인 켜기를 기다렸다가 해제하면 구독이 남지 않는다", async () => {
+    const push = await fresh();
+    st.hold = true;
+    const enabling = push.enablePush("A"); // 켜는 중에 로그아웃
+    await wait();
+    const waited = push.waitForPendingEnables(1000);
+    await wait();
+    releaseAll();
+    expect(await waited).toBe(true); // 켜기 완료를 기다린다
+    await enabling;
+    expect((await push.disablePush()).browser).toBe(true);
     expect(st.subscription).toBeNull();
   });
 
