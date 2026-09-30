@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+/* 목업의 색 체계: 짙은 청록(브랜드), 남색(CTA), 연민트(정보 배경), 주황(확인 필요) */
+@theme {
+  --color-brand: #0e5c52;
+  --color-brand-dark: #0a4a42;
+  --color-navy: #16213a;
+  --color-mint: #e5f3f0;
+  --color-mint-line: #c6e3dd;
+  --color-warn: #b45309;
+  --color-warn-bg: #fff1e0;
+  --color-line: #e3e8ee;
+  --color-muted: #5b6675;
+  --color-surface: #f7f9fa;
+  --font-sans: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+}
+
+html { background: var(--color-surface); color: var(--color-navy); }
+body { font-family: var(--font-sans); min-height: 100vh; }
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}
