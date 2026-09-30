@@ -180,6 +180,31 @@ describe("이전 계정 푸시 정리와 새 계정 켜기의 경합", () => {
     expect(st.subscription).toBeNull();
   });
 
+  it("권한 요청에 멈춰 있던 켜기가 로그아웃(해제) 뒤에 재개돼도 구독을 만들지 않는다", async () => {
+    const push = await fresh();
+    let open!: () => void;
+    st.permGate = new Promise<void>((r) => { open = r; });
+    const enabling = push.enablePush("A");
+    await wait();
+    expect((await push.disablePush()).browser).toBe(true); // 로그아웃 절차의 해제(대기 시간이 지나 그대로 진행한 경우 포함)
+    open(); // 해제 뒤에 권한 응답이 도착
+    const r = await enabling;
+    expect(r.ok).toBe(false);
+    expect(st.subscription).toBeNull(); // 로그아웃한 기기에 구독이 남지 않는다
+  });
+
+  it("서버 등록까지 끝난 켜기도 그 사이 해제가 있었다면 구독과 서버 행을 되돌린다", async () => {
+    const push = await fresh();
+    st.hold = true;
+    const enabling = push.enablePush("A");
+    await wait(); // 구독은 만들어졌고 서버 등록 응답만 대기 중
+    expect(st.subscription).not.toBeNull();
+    await push.disablePush(); // 로그아웃
+    releaseAll(); // 등록 성공 응답이 해제 뒤에 도착
+    expect((await enabling).ok).toBe(false);
+    expect(st.subscription).toBeNull();
+  });
+
   it("켜기가 진행 중이 아니면 바로 해제한다", async () => {
     const push = await fresh();
     expect((await push.disablePreviousAccountPush()).browser).toBe(true);
