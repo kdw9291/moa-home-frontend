@@ -14,7 +14,10 @@ export async function getDeviceSubscription(): Promise<PushSubscription | null> 
 export type EnableResult = { ok: true } | { ok: false; reason: "denied" | "dismissed" | "error"; message: string };
 
 /** 사용자 클릭 뒤 호출. 기존 이 기기 구독은 지우고 새로 만들어 다른 계정에 묶인 endpoint 충돌을 피한다. */
+let enableCount = 0; // enablePush 시작 횟수: 이전 계정 정리 작업이 그 사이에 켜진 새 구독을 지우지 않게 하는 표지
+
 export async function enablePush(userId: string): Promise<EnableResult> {
+  enableCount += 1;
   if (!supabase) return { ok: false, reason: "error", message: "설정이 없어 알림을 켤 수 없습니다." };
   try {
     const permission = await Notification.requestPermission();
@@ -46,7 +49,9 @@ export interface DisableResult {
   server: boolean; // 서버의 구독 행이 삭제됐는가(실패해도 만료 처리로 결국 정리된다)
 }
 
-export async function disablePush(): Promise<DisableResult> {
+/** skipIfReenabled: 계정 전환 뒤의 정리용. 기다리는 동안 새 계정이 알림을 켰다면 그 구독은 지우지 않는다. */
+export async function disablePush(opts: { skipIfReenabled?: boolean } = {}): Promise<DisableResult> {
+  const snap = enableCount;
   let sub: PushSubscription | null;
   try {
     sub = await getDeviceSubscription();
@@ -54,6 +59,7 @@ export async function disablePush(): Promise<DisableResult> {
     return { browser: false, server: false }; // 구독 상태를 확인하지 못함: 해제됐다고 말하지 않는다
   }
   if (!sub) return { browser: true, server: true };
+  if (opts.skipIfReenabled && enableCount !== snap) return { browser: true, server: true };
   // 브라우저 구독을 먼저 해제한다: 이것이 이 기기의 알림 수신을 멈춘다
   const browser = await sub.unsubscribe().catch(() => false);
   let server = false;

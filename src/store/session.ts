@@ -51,13 +51,18 @@ export const useSession = create<SessionState>((set, get) => {
     set({ user: session ? { id: session.user.id, email: session.user.email ?? null } : null, bookmarkIds: new Set(), bookmarksLoaded: false, ready: true, loginOpen: false });
     void onUserChanged(id);
     if (id) void loadBookmarks(id);
-    if (switched) {
+    if (switched) void cleanupPreviousPush();
+  }
+
+  async function cleanupPreviousPush() {
+    {
       // 세션이 signOut 절차를 거치지 않고 바뀌어도(다른 탭의 로그아웃·계정 교체) 이 기기가 이전 계정의 알림을 계속 받지 않게
       // 한다. 화면의 이전 계정 데이터는 위에서 이미 비웠고, 해제는 시간 제한을 두고 이어서 처리한다. 실패하면 사용자에게 알린다
       // (새 계정 세션 아래에서는 서버의 이전 행을 지울 수 없어 브라우저 구독 해제가 실제로 알림 수신을 멈추는 쪽이다).
+      // applyChain 밖에서 실행해 연속 전환이 지연되지 않게 한다. 경고는 켜기만 하고(사용자가 닫을 때까지) 뒤 결과가 덮어 끄지 못한다.
       const limit = new Promise<{ browser: boolean }>((resolve) => setTimeout(() => resolve({ browser: false }), 10_000));
-      const r = await Promise.race([disablePush().catch(() => ({ browser: false })), limit]);
-      set({ pushEpoch: get().pushEpoch + 1, pushWarning: !r.browser });
+      const r = await Promise.race([disablePush({ skipIfReenabled: true }).catch(() => ({ browser: false })), limit]);
+      set({ pushEpoch: get().pushEpoch + 1, pushWarning: get().pushWarning || !r.browser });
     }
   }
 
