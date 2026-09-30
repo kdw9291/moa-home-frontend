@@ -18,19 +18,21 @@ let enableCount = 0; // enablePush 시작 횟수
 let enableInFlight = 0; // 진행 중인 enablePush 수: 이전 계정 정리 작업이 새 계정의 켜기와 겹치지 않게 하는 표지
 
 const enablePending = new Set<Promise<unknown>>();
-let lastEnableOk = false;
+let subOwner: string | null = null; // 이 기기의 현재 브라우저 구독이 묶인 계정(켜기 성공 때 기록, 해제 때 비움)
 
 export async function enablePush(userId: string): Promise<EnableResult> {
   enableCount += 1;
   enableInFlight += 1;
   const run = enablePushInner(userId);
-  const tracked = run.then((r) => { lastEnableOk = r.ok; }, () => { lastEnableOk = false; });
+  const tracked: Promise<unknown> = run.then(
+    (r) => { if (r.ok) subOwner = userId; },
+    () => undefined,
+  ).finally(() => enablePending.delete(tracked));
   enablePending.add(tracked);
   try {
     return await run;
   } finally {
     enableInFlight -= 1;
-    void tracked.finally(() => enablePending.delete(tracked));
   }
 }
 
@@ -38,11 +40,12 @@ export async function enablePush(userId: string): Promise<EnableResult> {
  * 계정 전환 뒤 이전 계정의 알림 정리. 새 계정이 알림을 켜는 중이면 그 구독을 지우지 않도록 기다렸다가,
  * 켜기가 성공했으면 새 계정의 구독이므로 그대로 두고, 실패했으면 남아 있는 이전 구독을 지운다.
  */
-export async function disablePreviousAccountPush(): Promise<DisableResult> {
+export async function disablePreviousAccountPush(currentUserId: () => string | null = () => null): Promise<DisableResult> {
   const first = await disablePush({ skipIfReenabled: true });
   if (!first.skipped) return first;
-  await Promise.allSettled([...enablePending]);
-  if (lastEnableOk) return { browser: true, server: true };
+  while (enablePending.size > 0) await Promise.allSettled([...enablePending]); // 기다리는 동안 새로 시작된 켜기도 끝까지 기다린다
+  // 구독이 지금 세션의 계정에 묶여 있으면 그대로 둔다. 다른 계정(이전 계정 포함)의 구독이면 해제한다.
+  if (subOwner !== null && subOwner === currentUserId()) return { browser: true, server: true };
   return disablePush();
 }
 
@@ -92,6 +95,7 @@ export async function disablePush(opts: { skipIfReenabled?: boolean } = {}): Pro
   if (opts.skipIfReenabled && (enableCount !== snap || enableInFlight > 0)) return { browser: true, server: true, skipped: true }; // 새 계정이 켜는 중이거나 켰다면 그 구독을 지우지 않는다
   // 브라우저 구독을 먼저 해제한다: 이것이 이 기기의 알림 수신을 멈춘다
   const browser = await sub.unsubscribe().catch(() => false);
+  if (browser) subOwner = null;
   let server = false;
   try {
     const { error } = (await supabase?.from("push_subscriptions").delete().eq("endpoint", sub.endpoint)) ?? { error: null };

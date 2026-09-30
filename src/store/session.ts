@@ -36,6 +36,7 @@ export const useSession = create<SessionState>((set, get) => {
   }
 
   type AuthSession = { user: { id: string; email?: string | null } } | null;
+  let cleanupChain: Promise<void> = Promise.resolve();
   let applyChain: Promise<void> = Promise.resolve(); // 인증 상태 변경 처리를 순서대로 실행한다(푸시 해제를 기다리는 동안 다음 변경이 끼어들지 않게)
 
   async function applyNow(session: AuthSession) {
@@ -51,7 +52,7 @@ export const useSession = create<SessionState>((set, get) => {
     set({ user: session ? { id: session.user.id, email: session.user.email ?? null } : null, bookmarkIds: new Set(), bookmarksLoaded: false, ready: true, loginOpen: false });
     void onUserChanged(id);
     if (id) void loadBookmarks(id);
-    if (switched) void cleanupPreviousPush();
+    if (switched) cleanupChain = cleanupChain.then(() => cleanupPreviousPush()).catch(() => undefined); // 전환 순서대로 정리한다(applyChain과는 별개)
   }
 
   async function cleanupPreviousPush() {
@@ -61,7 +62,7 @@ export const useSession = create<SessionState>((set, get) => {
       // (새 계정 세션 아래에서는 서버의 이전 행을 지울 수 없어 브라우저 구독 해제가 실제로 알림 수신을 멈추는 쪽이다).
       // applyChain 밖에서 실행해 연속 전환이 지연되지 않게 한다. 경고는 켜기만 하고(사용자가 닫을 때까지) 뒤 결과가 덮어 끄지 못한다.
       const limit = new Promise<{ browser: boolean }>((resolve) => setTimeout(() => resolve({ browser: false }), 10_000));
-      const r = await Promise.race([disablePreviousAccountPush().catch(() => ({ browser: false })), limit]);
+      const r = await Promise.race([disablePreviousAccountPush(() => get().user?.id ?? null).catch(() => ({ browser: false })), limit]);
       set({ pushEpoch: get().pushEpoch + 1, pushWarning: get().pushWarning || !r.browser });
     }
   }

@@ -93,12 +93,23 @@ function writePending(userId: string, filters: Filters = usePrefs.getState().fil
   }
 }
 
+const LEGACY_PENDING_KEY = "moahome.pending.v1"; // 이전 버전의 단일 키(사용자 id가 일치할 때만 읽고, 정리 때 함께 지운다)
+
 function readPending(userId: string): Filters | null {
   try {
-    const raw = window.localStorage.getItem(pendingKey(userId));
+    const raw = window.localStorage.getItem(pendingKey(userId)) ?? legacyRaw(userId);
     if (!raw) return null;
     const p = JSON.parse(raw) as { userId?: string; filters?: unknown };
     return p.userId === userId ? sanitizePrefs({ filters: p.filters }).filters : null;
+  } catch {
+    return null;
+  }
+}
+
+function legacyRaw(userId: string): string | null {
+  try {
+    const raw = window.localStorage.getItem(LEGACY_PENDING_KEY);
+    return raw && (JSON.parse(raw) as { userId?: string }).userId === userId ? raw : null;
   } catch {
     return null;
   }
@@ -115,10 +126,29 @@ function clearPending(owner: string, saved?: Filters) {
       if (cur && !sameFilters(cur, saved)) return;
     }
     window.localStorage.removeItem(pendingKey(owner));
+    if (legacyRaw(owner)) window.localStorage.removeItem(LEGACY_PENDING_KEY);
   } catch {
     /* 무시 */
   }
 }
+
+// 미저장 초안 모델: 계정 모드에서 조건이 바뀌는 즉시 계정별 초안에 기록하고(서버 저장만 800ms 늦춘다),
+// 서버 저장이 성공했을 때 '저장된 값과 같은 초안'만 지운다. 저장 시작·실패 때 따로 쓰지 않는다.
+let draftFor: string | null = null;
+let draftLast = "";
+
+function startDraft(userId: string) {
+  draftFor = userId;
+  draftLast = JSON.stringify(usePrefs.getState().filters);
+}
+
+usePrefs.subscribe((s) => {
+  if (!draftFor || s.mode !== "account" || s.conflict) return;
+  const cur = JSON.stringify(s.filters);
+  if (cur === draftLast) return;
+  draftLast = cur;
+  writePending(draftFor, s.filters);
+});
 
 function clearLocal() {
   try {
@@ -182,14 +212,8 @@ function saveLatest(userId: string, gen: number): Promise<SaveResult> {
 function reportSave(gen: number, r: SaveResult) {
   if (r === "ignored" || stale(gen)) return;
   usePrefs.getState().setSaveStatus(r);
-  if (currentUser) {
-    if (r === "saved") {
-      // 저장하는 사이 조건이 또 바뀌었다면 그 새 값은 아직 저장되지 않았으니 복구 사본으로 남기고, 아니면 저장된 값의 사본만 지운다
-      const cur = usePrefs.getState().filters;
-      if (lastSaved && !sameFilters(cur, lastSaved)) writePending(currentUser);
-      else clearPending(currentUser, lastSaved ?? undefined);
-    } else if (r === "error" || r === "invalid") writePending(currentUser); // 새로고침해도 저장 못 한 조건을 잃지 않게(같은 계정일 때만 복구)
-  }
+  // 저장 성공: 저장된 값과 같은 초안만 지운다(저장하는 사이 더 바뀐 값이나 다른 탭의 더 새로운 초안은 남는다). 실패·invalid는 초안을 그대로 둔다.
+  if (currentUser && r === "saved") clearPending(currentUser, lastSaved ?? undefined);
 }
 
 /** 저장 실패 뒤 사용자가 누르는 '다시 저장': 현재 필터를 같은 경로로 다시 저장한다. */
@@ -232,6 +256,7 @@ export async function resolveConflict(choice: "local" | "server"): Promise<void>
   // 이후 await 동안 계정이 바뀌면 onUserChanged가 resetToGuest로 되돌린다.
   usePrefs.getState().setMode("account");
   applyFilters(chosen);
+  startDraft(userId);
   // 선택이 끝났으니 비회원 저장본과 이전 복구 사본은 정리한다. 내 조건 저장이 실패하면 reportSave가 사용자 전용 복구 사본을 새로 남긴다
   // (비회원 저장 키는 다른 계정에 넘어갈 수 있어 계정 조건을 남기지 않는다).
   clearLocal();
@@ -272,6 +297,7 @@ export async function onUserChanged(userId: string | null, opts: { localOverride
   const hadUser = prevUser !== null;
   currentUser = userId;
   epoch += 1;
+  draftFor = null; // 이전 계정의 초안 기록을 멈춘다(새 계정은 동기화 결정 뒤 다시 시작)
   const gen = epoch;
   revision = 0;
   lastSaved = null;
@@ -312,6 +338,7 @@ export async function onUserChanged(userId: string | null, opts: { localOverride
     if (d.action === "keep" && server) p.applyFilters(server.filters);
     if (d.action !== "push-local") clearPending(userId); // 서버 값을 쓰는 경우 이전 복구 사본은 더 쓰지 않는다
     if (local) clearLocal(); // 계정 모드에서는 비회원 저장본에 필터를 남기지 않는다(실패한 저장은 사용자 전용 복구 사본이 맡는다)
+    startDraft(userId);
     let savedFirst: Filters | undefined;
     if (d.action === "push-local") {
       p.applyFilters(local!);
