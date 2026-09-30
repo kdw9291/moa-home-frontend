@@ -8,6 +8,7 @@ const db = {
   releaseUpsert: null as null | (() => void),
   holdNextUpsert: false,
   holdGet: false,
+  failUpsert: false,
   releaseGet: null as null | (() => void),
   failGet: false,
 };
@@ -32,6 +33,7 @@ vi.mock("@/lib/supabase", () => ({
         }),
         upsert: (row: { user_id: string }) => {
           db.upserts.push(row);
+          if (db.failUpsert) return Promise.resolve({ error: { message: "rejected" } });
           if (db.holdNextUpsert) {
             db.holdNextUpsert = false;
             return new Promise((res) => (db.releaseUpsert = () => { db.serverRows[row.user_id] = row; res({ error: null }); }));
@@ -77,6 +79,7 @@ beforeEach(() => {
   db.releaseUpsert = null;
   db.holdNextUpsert = false;
   db.holdGet = false;
+  db.failUpsert = false;
   db.releaseGet = null;
   db.failGet = false;
 });
@@ -171,28 +174,114 @@ describe("계정 동기화: 경합·실패 경로", () => {
     expect(usePrefs.getState().saveStatus).toBe("saved");
   });
 
-  it("계정 조건 조회에 실패해도 로그인 상태에서는 브라우저에 필터를 쓰지 않고, 알린 뒤 다시 불러올 수 있다", async () => {
-    const { usePrefs, onUserChanged, retryAccountSync } = await fresh();
+  it("계정 조건 조회에 실패하면 계정 모드로 전환해 브라우저에 쓰지 않고 알린다", async () => {
+    const { usePrefs, onUserChanged } = await fresh();
     db.serverRows["A"] = serverRow("A", 500_000_000);
     db.failGet = true;
     await onUserChanged("A");
-    let s = usePrefs.getState();
+    const s = usePrefs.getState();
     expect(s.mode).toBe("account");                  // 비회원 저장 모드에 남지 않는다
     expect(s.saveStatus).toBe("load-error");
-    usePrefs.getState().setFilters({ keyword: "공용 PC에 남으면 안 되는 검색어", budgetMaxKrw: 300_000_000 });
+    s.setFilters({ keyword: "공용 PC에 남으면 안 되는 검색어", budgetMaxKrw: 300_000_000 });
     await tick(900);
     expect(store["moahome.prefs.v1"] ?? "").not.toContain("공용 PC");   // 브라우저 저장소에 쓰지 않음
     expect(store["moahome.prefs.v1"] ?? "").not.toContain("300000000");
     expect(db.upserts).toHaveLength(0);              // 서버에도 쓰지 않음(개정 번호를 알 수 없다)
+  });
+
+  it("조회 실패 중 바꾼 조건이 있고 서버 값과 다르면, 다시 불러올 때 버리지 않고 선택창으로 넘긴다", async () => {
+    const { usePrefs, onUserChanged, retryAccountSync, resolveConflict } = await fresh();
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    db.failGet = true;
+    await onUserChanged("A");
+    usePrefs.getState().setFilters({ budgetMaxKrw: 300_000_000 });
     db.failGet = false;
     await retryAccountSync();
     await tick();
-    s = usePrefs.getState();
+    expect(usePrefs.getState().conflict).toMatchObject({ local: { budgetMaxKrw: 300_000_000 }, server: { budgetMaxKrw: 500_000_000 } });
+    expect(usePrefs.getState().filters.budgetMaxKrw).toBe(300_000_000);   // 선택 전까지 화면의 조건을 유지
+    expect(db.upserts).toHaveLength(0);
+    await resolveConflict("local");                                        // 내 조건을 고르면 그때 저장
+    await tick();
+    expect(db.upserts.at(-1)).toMatchObject({ budget_max_krw: 300_000_000, revision: 2 });
+    expect(usePrefs.getState().saveStatus).toBe("saved");
+  });
+
+  it("조회 실패 중 바꾼 조건이 있고 서버에 행이 없으면, 다시 불러올 때 그 조건을 계정에 저장한다(저장된 것처럼 보이기만 하지 않는다)", async () => {
+    const { usePrefs, onUserChanged, retryAccountSync } = await fresh();
+    db.failGet = true;
+    await onUserChanged("A");
+    usePrefs.getState().setFilters({ budgetMaxKrw: 300_000_000 });
+    db.failGet = false;
+    await retryAccountSync();
+    await tick();
+    expect(db.upserts.at(-1)).toMatchObject({ user_id: "A", budget_max_krw: 300_000_000, revision: 1 });
+    expect(usePrefs.getState().saveStatus).toBe("saved");
+    expect((db.serverRows["A"] as { budget_max_krw: number }).budget_max_krw).toBe(300_000_000);
+  });
+
+  it("조회 실패 뒤 아무것도 바꾸지 않고 다시 불러오면 서버 값을 적용한다", async () => {
+    const { usePrefs, onUserChanged, retryAccountSync } = await fresh();
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    db.failGet = true;
+    await onUserChanged("A");
+    db.failGet = false;
+    await retryAccountSync();
+    await tick();
+    const s = usePrefs.getState();
     expect(s.saveStatus).toBe("idle");
-    expect(s.filters.budgetMaxKrw).toBe(500_000_000); // 서버 값 적용
+    expect(s.filters.budgetMaxKrw).toBe(500_000_000);
+    expect(s.conflict).toBeNull();
     s.setFilters({ budgetMaxKrw: 600_000_000 });
     await tick(900);
     expect(db.upserts.at(-1)).toMatchObject({ budget_max_krw: 600_000_000, revision: 2 }); // 서버 행 revision 1 다음
+  });
+
+  it("첫 저장이 실패하면 복구 가능한 로컬 사본을 지우지 않고, '다시 저장'이 성공하면 그때 지운다", async () => {
+    store["moahome.prefs.v1"] = JSON.stringify({ filters: { budgetMaxKrw: 400_000_000 }, tab: "open", sort: "latest" });
+    const { usePrefs, onUserChanged, retrySave } = await fresh();
+    db.failUpsert = true;
+    await onUserChanged("A");                                   // 서버 행 없음 + 로컬 조건 -> 첫 저장 시도(실패)
+    await tick();
+    expect(usePrefs.getState().saveStatus).toBe("error");
+    expect(usePrefs.getState().filters.budgetMaxKrw).toBe(400_000_000);
+    expect(store["moahome.prefs.v1"] ?? "").toContain("400000000");  // 로컬 사본이 남아 있다(새로고침 때 같은 경로로 재시도 가능)
+    db.failUpsert = false;
+    await retrySave();
+    await tick();
+    expect(usePrefs.getState().saveStatus).toBe("saved");
+    expect(db.upserts.at(-1)).toMatchObject({ budget_max_krw: 400_000_000 });
+    expect(store["moahome.prefs.v1"]).toBeUndefined();          // 서버에 저장됐으니 로컬 사본은 정리
+  });
+
+  it("멈춘 저장 요청은 시간 제한 뒤 실패로 처리되고 이후 저장을 막지 않는다", async () => {
+    const { usePrefs, onUserChanged, setSaveTimeoutForTests } = await fresh();
+    setSaveTimeoutForTests(150);
+    db.serverRows["A"] = serverRow("A", 100_000_000);
+    await onUserChanged("A");
+    db.holdNextUpsert = true;                                   // 첫 저장 요청은 끝내 응답하지 않는다
+    usePrefs.getState().setFilters({ budgetMaxKrw: 200_000_000 });
+    await tick(1200);                                           // 디바운스 + 시간 제한
+    expect(usePrefs.getState().saveStatus).toBe("error");
+    usePrefs.getState().setFilters({ budgetMaxKrw: 300_000_000 });
+    await tick(1200);                                           // 다음 저장은 정상 처리
+    expect(usePrefs.getState().saveStatus).toBe("saved");
+    expect((db.serverRows["A"] as { budget_max_krw: number }).budget_max_krw).toBe(300_000_000);
+  });
+
+  it("로그인 직후 계정 조건을 기다리는 동안의 변경은 브라우저 저장소에 쓰이지 않는다", async () => {
+    const { usePrefs, onUserChanged } = await fresh();
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    db.holdGet = true;                                          // 조회 응답을 붙잡는다
+    const pending = onUserChanged("A");
+    await tick();
+    expect(usePrefs.getState().syncing).toBe(true);
+    usePrefs.getState().setFilters({ keyword: "대기 중에 친 검색어", budgetMaxKrw: 123_000_000 });
+    await tick(100);
+    expect(store["moahome.prefs.v1"] ?? "").not.toContain("대기 중");
+    expect(store["moahome.prefs.v1"] ?? "").not.toContain("123000000");
+    db.releaseGet!();
+    await pending;
   });
 
   it("DB가 거부할 값(면적 0·비유한·범위 초과)은 서버로 보내지 않고 invalid로 알린다", async () => {

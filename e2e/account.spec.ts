@@ -24,6 +24,27 @@ test.describe("로그인 상태", () => {
     await expect(page.locator("article").first()).toBeVisible();
   }
 
+  test("모의 서버 자체 점검: 인증된 사용자도 다른 user_id로는 쓰거나 읽을 수 없고 Bearer 없이는 401이다", async ({ page }) => {
+    const OTHER = "22222222-2222-4222-8222-222222222222";
+    const h = await installMock(page, { auth: USER, serverFilters: { [OTHER]: serverRow({ user_id: OTHER }) } });
+    await openHome(page);
+    const r = await page.evaluate(async ({ key, other }) => {
+      const token = (JSON.parse(localStorage.getItem(key)!) as { access_token: string }).access_token;
+      const u = "https://selfcheck.example/rest/v1/user_filter_settings";
+      const call = (init: RequestInit, q = "") => fetch(u + q, init).then(async (x) => ({ status: x.status, body: await x.text() }));
+      const auth = { authorization: `Bearer ${token}`, "content-type": "application/json", prefer: "resolution=merge-duplicates" };
+      return {
+        writeOther: (await call({ method: "POST", headers: auth, body: JSON.stringify({ user_id: other }) }, "?on_conflict=user_id")).status,
+        readOther: (await call({ headers: auth }, `?user_id=eq.${other}`)).body,
+        noBearer: (await call({ headers: { authorization: token } }, `?user_id=eq.${other}`)).status,
+      };
+    }, { key: authStorageKey(), other: OTHER });
+    expect(r.writeOther).toBe(403);
+    expect(r.readOther).toBe("null");
+    expect(r.noBearer).toBe(401);
+    expect(h.serverFilters[OTHER]).toMatchObject({ budget_max_krw: 500_000_000 });   // 타인 행이 바뀌지 않았다
+  });
+
   test("로그인하면 헤더에 계정이 보이고 서버에 저장된 필터가 적용되며 브라우저에는 필터를 남기지 않는다", async ({ page }) => {
     const h = await installMock(page, { auth: USER, serverFilters: { [USER.userId]: serverRow() } });
     await openHome(page);
@@ -145,7 +166,7 @@ test.describe("로그인 상태", () => {
     expect(errors).toEqual([]);
   });
 
-  test("계정 조건을 불러오지 못하면 알리고, 그동안 바꾼 조건은 저장·브라우저 보관 없이 두었다가 '다시 불러오기'로 복구한다", async ({ page }) => {
+  test("계정 조건을 불러오지 못하면 알리고, 그동안 바꾼 조건은 저장·브라우저 보관 없이 두었다가 '다시 불러오기' 뒤 선택창으로 넘긴다", async ({ page }) => {
     const h = await installMock(page, { auth: USER, serverFilters: { [USER.userId]: serverRow() }, failFilterGet: true });
     await openHome(page);
     await expect(page.getByText("계정에 저장된 검색 조건을 불러오지 못했습니다")).toBeVisible();
@@ -158,6 +179,9 @@ test.describe("로그인 상태", () => {
     h.failFilterGet = false;                                     // 서버 복구
     await page.getByRole("button", { name: "다시 불러오기" }).click();
     await expect(page.getByText("계정에 저장된 검색 조건을 불러오지 못했습니다")).toBeHidden();
+    await expect(page.getByRole("dialog", { name: "어느 검색 조건을 사용할까요?" })).toBeVisible();   // 바꾼 조건을 조용히 버리지 않고 선택하게 한다
+    expect(h.filterUpserts).toEqual([]);
+    await page.getByRole("button", { name: /계정에 저장된 조건/ }).click();
     await expect(budget(page)).toHaveValue("5");                 // 서버에 저장돼 있던 조건이 적용된다
     await budget(page).selectOption("6");
     await expect.poll(() => h.filterUpserts.at(-1)?.revision, { timeout: 5000 }).toBe(4);   // 서버 revision 3 다음

@@ -155,9 +155,17 @@ export async function installMock(page: Page, opts: MockOptions = {}): Promise<M
     if (userTable) {
       // RLS 흉내: 사용자 토큰(Authorization: Bearer <로그인 세션 토큰>) 없이는 접근할 수 없다. 공개 키만 보내면 401.
       const authz = route.request().headers()["authorization"] ?? "";
-      const token = authz.replace(/^Bearer /, "");
+      const token = authz.startsWith("Bearer ") ? authz.slice(7) : "";
       const isUserToken = !!opts.auth && token.split(".").length === 3 && (() => { try { return JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString()).sub === opts.auth!.userId; } catch { return false; } })();
       if (!isUserToken) return json(route, { code: "42501", message: "permission denied (no user token)" }, 401);
+    }
+    const sub = opts.auth?.userId ?? "";
+    // RLS 흉내(user_id = auth.uid()): 조회 조건·쓰기 본문의 user_id가 토큰 사용자와 다르면 거부한다.
+    const scopedUid = userTable && method !== "GET" ? (() => { try { return (route.request().postDataJSON() as { user_id?: string } | null)?.user_id; } catch { return undefined; } })() : undefined;
+    if (userTable && scopedUid !== undefined && scopedUid !== sub) return json(route, { code: "42501", message: "new row violates row-level security policy" }, 403);
+    if (userTable && method === "GET") {
+      const q = url.searchParams.get("user_id")?.replace(/^eq\./, "");
+      if (q !== undefined && q !== sub) return json(route, url.pathname.endsWith("/user_filter_settings") ? null : [], 200); // RLS는 다른 사용자의 행을 조용히 걸러낸다
     }
     if (url.pathname.endsWith("/user_filter_settings")) {
       if (method === "GET") {

@@ -413,5 +413,8 @@ describe("계정 저장 가능 여부(DB 제약과 같은 기준)", () => {
     expect(filtersSavable(f({ minAreaSqm: 99_999_999.99 }))).toBe(true);
     expect(filtersSavable(f({ budgetMaxKrw: 1.5 }))).toBe(false);                 // bigint는 정수
     expect(filtersSavable(f({ budgetMaxKrw: 0 }))).toBe(true);
+    expect(filtersSavable(f({ minAreaSqm: 0.001 }))).toBe(false);                  // numeric(10,2) 반올림 뒤 0.00 -> > 0 위반
+    expect(filtersSavable(f({ maxAreaSqm: 0.004 }))).toBe(false);
+    expect(filtersSavable(f({ minAreaSqm: 0.01 }))).toBe(true);
   });
 });
