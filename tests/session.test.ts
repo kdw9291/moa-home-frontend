@@ -218,6 +218,20 @@ describe("세션과 북마크", () => {
     expect(useSession.getState().pushWarning).toBe(false);
   });
 
+  it("푸시 해제가 늦는 동안 온 두 번째 전환도 기다리지 않고 바로 반영된다", async () => {
+    const useSession = await fresh();
+    state.session = sess("A");
+    useSession.getState().init();
+    await tick();
+    pushDelay.ms = 300;
+    state.authListener!("SIGNED_IN", sess("B"));
+    await tick(30);
+    state.authListener!("SIGNED_IN", sess("C"));
+    await tick(30);
+    expect(useSession.getState().user?.id).toBe("C");             // 300ms 해제가 끝나기 전에 이미 C로 전환됨
+    await tick(700);
+  });
+
   it("다른 탭 로그아웃으로 비로그인이 돼도 푸시 해제에 실패하면 경고 상태가 켜진다", async () => {
     const useSession = await fresh();
     state.session = sess("A");

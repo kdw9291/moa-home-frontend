@@ -35,11 +35,13 @@ test.describe("로그인 상태", () => {
       const auth = { authorization: `Bearer ${token}`, "content-type": "application/json", prefer: "resolution=merge-duplicates" };
       return {
         writeOther: (await call({ method: "POST", headers: auth, body: JSON.stringify({ user_id: other }) }, "?on_conflict=user_id")).status,
+        writeNoUser: (await call({ method: "POST", headers: auth, body: JSON.stringify({ budget_max_krw: 1 }) }, "?on_conflict=user_id")).status,
         readOther: (await call({ headers: auth }, `?user_id=eq.${other}`)).body,
         noBearer: (await call({ headers: { authorization: token } }, `?user_id=eq.${other}`)).status,
       };
     }, { key: authStorageKey(), other: OTHER });
     expect(r.writeOther).toBe(403);
+    expect(r.writeNoUser).toBe(403);                                              // user_id 누락 쓰기도 RLS(user_id = auth.uid())에 걸린다
     expect(r.readOther).toBe("null");
     expect(r.noBearer).toBe(401);
     expect(h.serverFilters[OTHER]).toMatchObject({ budget_max_krw: 500_000_000 });   // 타인 행이 바뀌지 않았다
