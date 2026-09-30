@@ -34,7 +34,8 @@ vi.mock("@/lib/supabase", () => ({
 }));
 const pushResult = { browser: true, server: true };
 const pushDelay = { ms: 0 };
-vi.mock("@/lib/pushClient", () => ({ disablePush: () => { state.calls.push("disablePush"); return new Promise((r) => setTimeout(() => r({ ...pushResult }), pushDelay.ms)); } }));
+const fakeDisable = () => { state.calls.push("disablePush"); return new Promise((r) => setTimeout(() => r({ ...pushResult }), pushDelay.ms)); };
+vi.mock("@/lib/pushClient", () => ({ disablePush: fakeDisable, disablePreviousAccountPush: fakeDisable }));
 const onUserChanged = vi.fn((_id: string | null) => Promise.resolve());
 vi.mock("@/store/account", () => ({ onUserChanged: (id: string | null) => onUserChanged(id) }));
 

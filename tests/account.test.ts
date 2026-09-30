@@ -246,13 +246,13 @@ describe("계정 동기화: 경합·실패 경로", () => {
     expect(usePrefs.getState().saveStatus).toBe("error");
     expect(usePrefs.getState().filters.budgetMaxKrw).toBe(400_000_000);
     expect(store["moahome.prefs.v1"]).toBeUndefined();               // 비회원 저장 키에는 계정 조건을 남기지 않는다(다른 계정에 넘어갈 수 있다)
-    expect(store["moahome.pending.v1"]).toContain("400000000");      // 사용자 전용 복구 사본이 남아 있다(새로고침 때 같은 계정이면 복구)
+    expect(store["moahome.pending.v2:A"]).toContain("400000000");      // 사용자 전용 복구 사본이 남아 있다(새로고침 때 같은 계정이면 복구)
     db.failUpsert = false;
     await retrySave();
     await tick();
     expect(usePrefs.getState().saveStatus).toBe("saved");
     expect(db.upserts.at(-1)).toMatchObject({ budget_max_krw: 400_000_000 });
-    expect(store["moahome.pending.v1"]).toBeUndefined();        // 서버에 저장됐으니 복구 사본은 정리
+    expect(store["moahome.pending.v2:A"]).toBeUndefined();        // 서버에 저장됐으니 복구 사본은 정리
   });
 
   it("멈춘 저장 요청은 시간 제한 뒤 실패로 처리되고 이후 저장을 막지 않는다", async () => {
@@ -311,7 +311,7 @@ describe("계정 동기화: 재리뷰 #3 보완", () => {
     expect(first.usePrefs.getState().saveStatus).toBe("error");
     // 계정 모드에서 바뀐 조건은 비회원 저장 키가 아니라 사용자 전용 복구 사본에 남는다
     delete store["moahome.prefs.v1"];
-    expect(store["moahome.pending.v1"]).toContain("300000000");
+    expect(store["moahome.pending.v2:A"]).toContain("300000000");
     db.failUpsert = false;
     const reloaded = await fresh();                              // 새로고침
     await reloaded.onUserChanged("A");
@@ -320,7 +320,7 @@ describe("계정 동기화: 재리뷰 #3 보완", () => {
   });
 
   it("복구 사본은 다른 계정에 섞이지 않고 로그아웃하면 지워진다", async () => {
-    store["moahome.pending.v1"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
+    store["moahome.pending.v2:A"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
     db.serverRows["B"] = serverRow("B", 700_000_000);
     const { usePrefs, onUserChanged } = await fresh();
     await onUserChanged("B");
@@ -328,16 +328,16 @@ describe("계정 동기화: 재리뷰 #3 보완", () => {
     expect(usePrefs.getState().filters.budgetMaxKrw).toBe(700_000_000);
     expect(usePrefs.getState().conflict).toBeNull();
     await onUserChanged(null);                                   // B의 로그아웃은 A의 복구 사본을 건드리지 않는다
-    expect(store["moahome.pending.v1"]).toContain('"userId":"A"');
+    expect(store["moahome.pending.v2:A"]).toContain('"userId":"A"');
   });
 
   it("자기 계정의 복구 사본은 로그아웃하면 지워진다", async () => {
     db.serverRows["A"] = serverRow("A", 500_000_000);
-    store["moahome.pending.v1"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
+    store["moahome.pending.v2:A"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
     const { onUserChanged } = await fresh();
     await onUserChanged("A");                                    // 충돌창이 열린 상태
     await onUserChanged(null);
-    expect(store["moahome.pending.v1"]).toBeUndefined();
+    expect(store["moahome.pending.v2:A"]).toBeUndefined();
   });
 
   it("조회를 기다리는 동안 바꾼 조건은 응답이 와도 서버 값에 덮이지 않고 선택창으로 간다", async () => {
@@ -358,12 +358,12 @@ describe("계정 동기화: 재리뷰 #3 보완", () => {
 describe("계정 동기화: 재리뷰 #4 보완", () => {
   it("서버 조건을 선택하면 오래된 복구 사본도 지워져 다음 세션에 되살아나지 않는다", async () => {
     db.serverRows["A"] = serverRow("A", 500_000_000);
-    store["moahome.pending.v1"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
+    store["moahome.pending.v2:A"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
     const first = await fresh();
     await first.onUserChanged("A");
     expect(first.usePrefs.getState().conflict).not.toBeNull();
     await first.resolveConflict("server");
-    expect(store["moahome.pending.v1"]).toBeUndefined();
+    expect(store["moahome.pending.v2:A"]).toBeUndefined();
     const again = await fresh();
     await again.onUserChanged("A");
     await tick();
@@ -373,12 +373,12 @@ describe("계정 동기화: 재리뷰 #4 보완", () => {
 
   it("복구 사본이 있는데 첫 조회가 실패하면, 기본 조건으로 '다시 불러오기'를 해도 복구 사본이 가려지지 않는다", async () => {
     db.serverRows["A"] = serverRow("A", 500_000_000);
-    store["moahome.pending.v1"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
+    store["moahome.pending.v2:A"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
     const { usePrefs, onUserChanged, retryAccountSync } = await fresh();
     db.failGet = true;
     await onUserChanged("A");
     expect(usePrefs.getState().saveStatus).toBe("load-error");
-    expect(store["moahome.pending.v1"]).toContain("300000000");   // 실패 중에는 지우지 않는다
+    expect(store["moahome.pending.v2:A"]).toContain("300000000");   // 실패 중에는 지우지 않는다
     db.failGet = false;
     await retryAccountSync();                                     // 화면은 기본 조건(바꾼 적 없음)
     await tick();
@@ -415,12 +415,12 @@ describe("계정 동기화: 재리뷰 #5 보완", () => {
     const p = resolveConflict("local");
     await tick(50);
     expect(store["moahome.prefs.v1"]).toBeUndefined();
-    expect(store["moahome.pending.v1"]).toContain("300000000");  // 탭이 닫혀도 잃지 않는다
+    expect(store["moahome.pending.v2:A"]).toContain("300000000");  // 탭이 닫혀도 잃지 않는다
     db.releaseUpsert!();
     await p;
     await tick();
     expect(usePrefs.getState().saveStatus).toBe("saved");
-    expect(store["moahome.pending.v1"]).toBeUndefined();
+    expect(store["moahome.pending.v2:A"]).toBeUndefined();
   });
 
   it("서버 행이 없는 로그인에서도 저장이 끝나기 전에 복구 사본이 남는다", async () => {
@@ -429,11 +429,11 @@ describe("계정 동기화: 재리뷰 #5 보완", () => {
     db.holdNextUpsert = true;
     const p = onUserChanged("A");
     await tick(50);
-    expect(store["moahome.pending.v1"]).toContain("400000000");
+    expect(store["moahome.pending.v2:A"]).toContain("400000000");
     db.releaseUpsert!();
     await p;
     await tick();
-    expect(store["moahome.pending.v1"]).toBeUndefined();
+    expect(store["moahome.pending.v2:A"]).toBeUndefined();
   });
 
   it("충돌창을 연 채 새로고침해도 후보가 남는다(조회 실패 중 입력한 조건 포함)", async () => {
@@ -454,7 +454,7 @@ describe("계정 동기화: 재리뷰 #5 보완", () => {
 
   it("조회 실패 뒤 표시 단위만 바꾸고 다시 불러와도 복구 사본이 우선한다", async () => {
     db.serverRows["A"] = serverRow("A", 500_000_000);
-    store["moahome.pending.v1"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
+    store["moahome.pending.v2:A"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
     const { usePrefs, onUserChanged, retryAccountSync } = await fresh();
     db.failGet = true;
     await onUserChanged("A");
@@ -463,6 +463,67 @@ describe("계정 동기화: 재리뷰 #5 보완", () => {
     await retryAccountSync();
     await tick();
     expect(usePrefs.getState().conflict).toMatchObject({ local: { budgetMaxKrw: 300_000_000 } });
+  });
+});
+
+describe("계정 동기화: 재리뷰 #6 보완", () => {
+  it("조회를 기다리는 동안 표시 단위만 바꿔도 복구 사본은 지워지지 않는다", async () => {
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    store["moahome.pending.v2:A"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
+    const { usePrefs, onUserChanged } = await fresh();
+    db.holdGet = true;
+    const p = onUserChanged("A");
+    await tick();
+    usePrefs.getState().setFilters({ areaUnit: "pyeong" });
+    db.releaseGet!();
+    await p;
+    await tick();
+    expect(usePrefs.getState().conflict).toMatchObject({ local: { budgetMaxKrw: 300_000_000 }, server: { budgetMaxKrw: 500_000_000 } });
+    expect(store["moahome.pending.v2:A"]).toContain("300000000");
+  });
+
+  it("첫 저장을 기다리는 동안 다시 바꾼 조건도 저장되고, 저장된 값과 다른 동안은 복구 사본이 남는다", async () => {
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    store["moahome.prefs.v1"] = JSON.stringify({ filters: { budgetMaxKrw: 300_000_000 }, tab: "open", sort: "latest" });
+    const { usePrefs, onUserChanged, resolveConflict } = await fresh();
+    await onUserChanged("A");
+    db.holdNextUpsert = true;
+    const p = resolveConflict("local");
+    await tick(50);
+    usePrefs.getState().setFilters({ budgetMaxKrw: 400_000_000 }); // 첫 저장(3억)이 끝나기 전에 4억으로 변경
+    db.releaseUpsert!();
+    await p;
+    await tick(50);
+    expect(store["moahome.pending.v2:A"]).toContain("400000000"); // 4억은 아직 저장 전이라 복구 사본이 남는다
+    await tick(1200); // 자동 저장이 4억을 저장
+    expect((db.serverRows["A"] as { budget_max_krw: number }).budget_max_krw).toBe(400_000_000);
+    expect(store["moahome.pending.v2:A"]).toBeUndefined();
+  });
+
+  it("다른 계정의 복구 사본은 B가 충돌창을 열거나 저장해도 덮이지 않는다(계정별 키)", async () => {
+    store["moahome.pending.v2:A"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
+    store["moahome.prefs.v1"] = JSON.stringify({ filters: { budgetMaxKrw: 900_000_000 }, tab: "open", sort: "latest" });
+    db.serverRows["B"] = serverRow("B", 700_000_000);
+    const { onUserChanged, resolveConflict } = await fresh();
+    await onUserChanged("B");
+    expect(store["moahome.pending.v2:B"]).toContain("900000000");
+    expect(store["moahome.pending.v2:A"]).toContain("300000000"); // A의 사본은 그대로
+    await resolveConflict("local");
+    await tick();
+    expect(store["moahome.pending.v2:A"]).toContain("300000000");
+  });
+
+  it("같은 계정의 다른 탭이 남긴 더 새로운 복구 사본은 이전 저장 성공이 지우지 않는다", async () => {
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    const { usePrefs, onUserChanged } = await fresh();
+    await onUserChanged("A");
+    db.holdNextUpsert = true;
+    usePrefs.getState().setFilters({ budgetMaxKrw: 300_000_000 });
+    await tick(900); // 저장 요청(3억)이 나간 상태
+    store["moahome.pending.v2:A"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 888_000_000 } }); // 다른 탭이 남긴 사본
+    db.releaseUpsert!();
+    await tick(100);
+    expect(store["moahome.pending.v2:A"]).toContain("888000000");
   });
 });
 
