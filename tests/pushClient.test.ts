@@ -1,12 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// 새 계정의 알림 켜기와 이전 계정 정리가 겹칠 때: 켜기가 성공하면 새 구독을 지우지 않고, 실패하면 남은 이전 구독을 지운다.
+// 새 계정의 알림 켜기와 이전 계정 정리가 겹칠 때: 현재 세션 계정의 구독은 지우지 않고, 다른 계정의 구독은 지운다.
 type Sub = { endpoint: string; unsubscribe: () => Promise<boolean>; toJSON: () => unknown };
 const st = {
   subscription: null as Sub | null,
   upsertError: null as null | { message: string },
   hold: false,
-  release: (() => {}) as () => void,
+  releases: [] as (() => void)[],
+  n: 0,
+};
+// 붙잡아 둔 서버 등록 응답을 나중에 도착한 요청부터 풀어, 응답 순서와 구독 생성 순서가 어긋나는 상황을 만든다.
+const releaseAll = () => {
+  const r = [...st.releases].reverse();
+  st.releases = [];
+  r.forEach((f) => f());
 };
 
 vi.mock("@/lib/supabase", () => ({
@@ -15,7 +22,7 @@ vi.mock("@/lib/supabase", () => ({
       upsert: () =>
         new Promise((res) => {
           const done = () => res({ error: st.upsertError });
-          if (st.hold) st.release = done;
+          if (st.hold) st.releases.push(done);
           else done();
         }),
       delete: () => ({ eq: () => Promise.resolve({ error: null }) }),
@@ -39,13 +46,15 @@ const wait = (ms = 20) => new Promise((r) => setTimeout(r, ms));
 beforeEach(() => {
   st.upsertError = null;
   st.hold = false;
-  st.release = () => {};
+  st.releases = [];
+  st.n = 0;
   st.subscription = mkSub("old-A");
   const reg = {
     pushManager: {
       getSubscription: () => Promise.resolve(st.subscription),
       subscribe: () => {
-        st.subscription = mkSub("new-B");
+        st.n += 1;
+        st.subscription = mkSub(`new-${st.n}`);
         return Promise.resolve(st.subscription);
       },
     },
@@ -67,10 +76,10 @@ describe("이전 계정 푸시 정리와 새 계정 켜기의 경합", () => {
     await wait();
     const cleanup = push.disablePreviousAccountPush(() => "B"); // 세션의 현재 계정은 B
     await wait();
-    st.release(); // 등록 성공
+    releaseAll(); // 등록 성공
     expect((await enabling).ok).toBe(true);
     expect((await cleanup).browser).toBe(true);
-    expect(st.subscription?.endpoint).toBe("new-B"); // 새 구독 유지
+    expect(st.subscription?.endpoint).toBe("new-1"); // 새 구독 유지
   });
 
   it("새 계정 켜기가 실패하면 남아 있는 이전 구독을 지운다", async () => {
@@ -81,11 +90,10 @@ describe("이전 계정 푸시 정리와 새 계정 켜기의 경합", () => {
     await wait();
     const cleanup = push.disablePreviousAccountPush(() => "B");
     await wait();
-    st.release(); // 등록 실패 -> 새 구독도 해제됨
+    releaseAll(); // 등록 실패 -> 새 구독도 해제됨
     expect((await enabling).ok).toBe(false);
-    st.subscription = mkSub("old-A"); // 실패 뒤에도 이전 구독이 남아 있는 상황
-    expect((await cleanup).browser).toBe(true);
-    expect(st.subscription).toBeNull(); // 이전 구독 정리됨
+    expect((await cleanup).browser).toBe(true); // 켜기 실패 뒤 정리가 끝까지 수행된다
+    expect(st.subscription).toBeNull(); // 이전 구독도 새 구독도 남지 않는다
   });
 
   it("A→B→C 전환에서 B의 켜기가 성공해도 세션이 C이면 B의 구독을 해제한다", async () => {
@@ -96,10 +104,33 @@ describe("이전 계정 푸시 정리와 새 계정 켜기의 경합", () => {
     const cleanupAB = push.disablePreviousAccountPush(() => "C"); // A→B 정리이지만 세션은 이미 C
     const cleanupBC = push.disablePreviousAccountPush(() => "C");
     await wait();
-    st.release();
+    releaseAll();
     expect((await enabling).ok).toBe(true);
     await Promise.all([cleanupAB, cleanupBC]);
     expect(st.subscription).toBeNull(); // C가 B의 알림을 받지 않는다
+  });
+
+  it("C가 알림을 켠 뒤에 도는 뒤늦은 정리는 C의 구독을 지우지 않는다", async () => {
+    const push = await fresh();
+    expect((await push.enablePush("C")).ok).toBe(true); // 진행 중인 켜기 없음, 구독 소유는 C
+    const cleanup1 = push.disablePreviousAccountPush(() => "C");
+    const cleanup2 = push.disablePreviousAccountPush(() => "C");
+    await Promise.all([cleanup1, cleanup2]);
+    expect(st.subscription?.endpoint).toBe("new-1");
+  });
+
+  it("동시에 진행된 켜기의 서버 응답 순서가 달라도 마지막으로 만든 구독의 소유 계정을 기준으로 한다", async () => {
+    const push = await fresh();
+    st.hold = true;
+    const enableB = push.enablePush("B"); // B의 구독(new-1)이 먼저 만들어지고 응답은 지연
+    await wait();
+    const enableA = push.enablePush("A"); // 이어서 A의 구독(new-2)이 만들어진다(현재 브라우저 구독은 A)
+    await wait();
+    releaseAll(); // 나중 요청(A)의 응답이 먼저, B의 응답이 늦게 도착
+    await Promise.all([enableB, enableA]);
+    const r = await push.disablePreviousAccountPush(() => "B"); // 세션은 B로 돌아왔다: A의 구독은 해제해야 한다
+    expect(r.browser).toBe(true);
+    expect(st.subscription).toBeNull();
   });
 
   it("켜기가 진행 중이 아니면 바로 해제한다", async () => {
