@@ -527,6 +527,47 @@ describe("계정 동기화: 재리뷰 #6 보완", () => {
   });
 });
 
+describe("계정 동기화: 미저장 초안 모델(재리뷰 #7 보완)", () => {
+  it("자동 저장 대기(800ms) 중에도 바뀐 조건이 즉시 초안에 기록되고, 저장이 끝나면 지워진다", async () => {
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    const { usePrefs, onUserChanged } = await fresh();
+    await onUserChanged("A");
+    expect(store["moahome.pending.v2:A"]).toBeUndefined();
+    usePrefs.getState().setFilters({ budgetMaxKrw: 300_000_000 });
+    await tick(50);                                                  // 저장 타이머가 돌기 전에 새로고침해도
+    expect(store["moahome.pending.v2:A"]).toContain("300000000");     // 초안에 남아 있다
+    await tick(1200);
+    expect(db.upserts.at(-1)).toMatchObject({ budget_max_krw: 300_000_000 });
+    expect(store["moahome.pending.v2:A"]).toBeUndefined();
+  });
+
+  it("다른 탭의 더 새로운 초안을 이전 저장의 성공·재변경이 덮어쓰지 않는다", async () => {
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    const { usePrefs, onUserChanged } = await fresh();
+    await onUserChanged("A");
+    usePrefs.getState().setFilters({ budgetMaxKrw: 300_000_000 });
+    await tick(900);
+    db.holdNextUpsert = true;
+    usePrefs.getState().setFilters({ budgetMaxKrw: 310_000_000 });
+    await tick(900);                                                 // 3.1억 저장 요청이 나간 상태
+    store["moahome.pending.v2:A"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 888_000_000 } }); // 다른 탭의 초안
+    db.releaseUpsert!();
+    await tick(100);
+    expect(store["moahome.pending.v2:A"]).toContain("888000000");
+  });
+
+  it("이전 버전의 단일 복구 키(v1)도 같은 계정이면 복구하고 정리한다", async () => {
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    store["moahome.pending.v1"] = JSON.stringify({ userId: "A", filters: { budgetMaxKrw: 300_000_000 } });
+    const { usePrefs, onUserChanged, resolveConflict } = await fresh();
+    await onUserChanged("A");
+    expect(usePrefs.getState().conflict).toMatchObject({ local: { budgetMaxKrw: 300_000_000 } });
+    await resolveConflict("server");
+    expect(store["moahome.pending.v1"]).toBeUndefined();
+    expect(store["moahome.pending.v2:A"]).toBeUndefined();
+  });
+});
+
 // 타입 확인용(사용하지 않음): Filters 형태가 바뀌면 컴파일 단계에서 알 수 있게 한다
 const _shape: Pick<Filters, "budgetMaxKrw"> = { budgetMaxKrw: null };
 void _shape;

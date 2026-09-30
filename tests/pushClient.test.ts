@@ -65,7 +65,7 @@ describe("이전 계정 푸시 정리와 새 계정 켜기의 경합", () => {
     st.hold = true; // 새 계정의 서버 등록 응답을 붙잡는다
     const enabling = push.enablePush("B");
     await wait();
-    const cleanup = push.disablePreviousAccountPush();
+    const cleanup = push.disablePreviousAccountPush(() => "B"); // 세션의 현재 계정은 B
     await wait();
     st.release(); // 등록 성공
     expect((await enabling).ok).toBe(true);
@@ -79,13 +79,27 @@ describe("이전 계정 푸시 정리와 새 계정 켜기의 경합", () => {
     st.upsertError = { message: "boom" };
     const enabling = push.enablePush("B");
     await wait();
-    const cleanup = push.disablePreviousAccountPush();
+    const cleanup = push.disablePreviousAccountPush(() => "B");
     await wait();
     st.release(); // 등록 실패 -> 새 구독도 해제됨
     expect((await enabling).ok).toBe(false);
     st.subscription = mkSub("old-A"); // 실패 뒤에도 이전 구독이 남아 있는 상황
     expect((await cleanup).browser).toBe(true);
     expect(st.subscription).toBeNull(); // 이전 구독 정리됨
+  });
+
+  it("A→B→C 전환에서 B의 켜기가 성공해도 세션이 C이면 B의 구독을 해제한다", async () => {
+    const push = await fresh();
+    st.hold = true;
+    const enabling = push.enablePush("B");
+    await wait();
+    const cleanupAB = push.disablePreviousAccountPush(() => "C"); // A→B 정리이지만 세션은 이미 C
+    const cleanupBC = push.disablePreviousAccountPush(() => "C");
+    await wait();
+    st.release();
+    expect((await enabling).ok).toBe(true);
+    await Promise.all([cleanupAB, cleanupBC]);
+    expect(st.subscription).toBeNull(); // C가 B의 알림을 받지 않는다
   });
 
   it("켜기가 진행 중이 아니면 바로 해제한다", async () => {
