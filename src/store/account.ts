@@ -66,6 +66,12 @@ let unsub: (() => void) | null = null;
 let queue: Promise<unknown> = Promise.resolve();
 const stale = (gen: number) => gen !== epoch;
 
+/** 저장 요청이 이 시간 안에 끝나지 않으면 중단하고 실패로 본다(멈춘 요청이 이후 모든 저장을 막지 않게). */
+let saveTimeoutMs = 15_000;
+export function setSaveTimeoutForTests(ms: number) {
+  saveTimeoutMs = ms;
+}
+
 function readLocalFilters(): Filters | null {
   try {
     const raw = window.localStorage.getItem(PREFS_KEY);
@@ -91,6 +97,27 @@ async function fetchServer(userId: string): Promise<{ filters: Filters; revision
 
 type SaveResult = "saved" | "error" | "invalid" | "ignored";
 
+/** upsert 한 번: 시간 제한을 두고, 제한을 넘기면 요청을 중단한다(abortSignal을 지원하면 사용). */
+async function upsertWithTimeout(row: Row): Promise<{ error: unknown }> {
+  const ctrl = new AbortController();
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<{ error: unknown }>((resolve) => {
+    timeoutId = setTimeout(() => {
+      ctrl.abort();
+      resolve({ error: new Error("timeout") });
+    }, saveTimeoutMs);
+  });
+  try {
+    const q = supabase!.from("user_filter_settings").upsert(row, { onConflict: "user_id" }) as unknown as PromiseLike<{ error: unknown }> & { abortSignal?: (s: AbortSignal) => PromiseLike<{ error: unknown }> };
+    const req = typeof q.abortSignal === "function" ? q.abortSignal(ctrl.signal) : q;
+    return await Promise.race([Promise.resolve(req), timeout]);
+  } catch (e) {
+    return { error: e };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 /**
  * 저장은 한 번에 하나씩 순서대로 실행하고, 저장할 값은 '실행 시점의 최신 필터'를 읽는다.
  * 그래서 느린 이전 저장이 나중 저장을 덮어쓰지 못하고, 개정 번호도 순서대로 증가한다.
@@ -102,7 +129,7 @@ function saveLatest(userId: string, gen: number): Promise<SaveResult> {
     const f = usePrefs.getState().filters;
     if (!filtersSavable(f)) return "invalid"; // DB 제약에 걸릴 값은 서버로 보내지 않는다
     const next = revision + 1;
-    const { error } = await supabase!.from("user_filter_settings").upsert(filtersToRow(userId, f, next), { onConflict: "user_id" });
+    const { error } = await upsertWithTimeout(filtersToRow(userId, f, next));
     if (stale(gen)) return "ignored"; // 저장 중 계정이 바뀜: 새 세대의 개정 번호·상태를 건드리지 않는다
     if (error) return "error";
     revision = next;
@@ -115,6 +142,16 @@ function saveLatest(userId: string, gen: number): Promise<SaveResult> {
 function reportSave(gen: number, r: SaveResult) {
   if (r === "ignored" || stale(gen)) return;
   usePrefs.getState().setSaveStatus(r);
+}
+
+/** 저장 실패 뒤 사용자가 누르는 '다시 저장': 현재 필터를 같은 경로로 다시 저장한다. */
+export async function retrySave(): Promise<void> {
+  const userId = currentUser;
+  const gen = epoch;
+  if (!userId) return;
+  const r = await saveLatest(userId, gen);
+  reportSave(gen, r);
+  if (r === "saved" && !stale(gen)) clearLocal(); // 서버에 저장됐으니 남겨 둔 로컬 사본을 정리
 }
 
 function startAutosave(userId: string, gen: number) {
@@ -140,24 +177,33 @@ export async function resolveConflict(choice: "local" | "server"): Promise<void>
   // 이후 await 동안 계정이 바뀌면 onUserChanged가 resetToGuest로 되돌린다.
   usePrefs.getState().setMode("account");
   applyFilters(chosen);
-  if (choice === "local") reportSave(gen, await saveLatest(userId, gen));
+  let keepLocal = false;
+  if (choice === "local") {
+    const r = await saveLatest(userId, gen);
+    reportSave(gen, r);
+    keepLocal = r !== "saved" && r !== "ignored"; // 첫 저장이 실패하면 복구 가능한 로컬 사본을 지우지 않는다(다시 로그인·새로고침 때 이어서 시도)
+  }
   if (stale(gen)) return; // 저장 중 계정이 바뀜: 이전 계정의 필터를 적용하지 않는다
   setConflict(null);
-  clearLocal();
+  if (!keepLocal) clearLocal();
   usePrefs.getState().setSyncing(false);
   startAutosave(userId, gen);
 }
 
-/** 조회 실패 뒤 '다시 시도': 같은 계정으로 동기화를 처음부터 다시 한다. */
+/**
+ * 조회 실패 뒤 '다시 불러오기': 같은 계정으로 동기화를 처음부터 다시 한다.
+ * 실패 상태에서 사용자가 바꾼 화면 속 조건은 버리지 않고 '로컬 후보'로 넘겨, 서버 값과 다르면 선택창을 띄운다.
+ */
 export async function retryAccountSync(): Promise<void> {
   const u = currentUser;
   if (!u) return;
+  const inMemory = usePrefs.getState().filters;
   currentUser = null;
-  await onUserChanged(u);
+  await onUserChanged(u, { localOverride: inMemory });
 }
 
 /** 로그인/계정 변경/로그아웃 때 호출. userId가 null이면 개인 데이터를 모두 제거한다. */
-export async function onUserChanged(userId: string | null): Promise<void> {
+export async function onUserChanged(userId: string | null, opts: { localOverride?: Filters } = {}): Promise<void> {
   if (userId === currentUser) return;
   unsub?.();
   unsub = null;
@@ -174,9 +220,9 @@ export async function onUserChanged(userId: string | null): Promise<void> {
   if (hadUser) usePrefs.getState().resetToGuest(); // 계정 전환: 이전 계정의 필터가 섞이지 않게 먼저 비운다
   if (!supabase) return;
   usePrefs.getState().setSaveStatus("idle");
-  usePrefs.getState().setSyncing(true);
+  usePrefs.getState().setSyncing(true); // 동기화 중에는 비회원 저장 훅이 브라우저에 쓰지 않는다(prefs.ts)
   try {
-    const local = hadUser ? null : readLocalFilters();
+    const local = hadUser ? null : (opts.localOverride ?? readLocalFilters());
     const server = await fetchServer(userId);
     if (stale(gen)) return; // 조회 중 계정이 바뀜(같은 사용자로 되돌아온 경우 포함)
     revision = server?.revision ?? 0;
@@ -189,18 +235,20 @@ export async function onUserChanged(userId: string | null): Promise<void> {
     p.setMode("account"); // 필터를 적용하기 전에 계정 모드로: 적용된 값이 브라우저 저장소에 쓰이지 않게
     if (d.action === "adopt-server") p.applyFilters(server!.filters);
     if (d.action === "keep" && server) p.applyFilters(server.filters);
+    let keepLocal = false;
     if (d.action === "push-local") {
       p.applyFilters(local!);
       const r = await saveLatest(userId, gen);
       if (stale(gen)) return; // 저장 중 계정이 바뀜
       reportSave(gen, r);
+      keepLocal = r !== "saved"; // 첫 저장이 실패하면 복구 가능한 로컬 사본을 지우지 않는다(새로고침 때 같은 경로로 다시 시도)
     }
-    if (local) clearLocal(); // 계정 모드에서는 브라우저에 필터를 남기지 않는다
+    if (local && !keepLocal) clearLocal(); // 계정 모드에서는 브라우저에 필터를 남기지 않는다
     startAutosave(userId, gen);
   } catch {
     if (!stale(gen)) {
       // 서버 조회 실패: 로그인 상태인데 비회원 저장 모드에 남으면 이후 변경이 브라우저에 쓰이므로 계정 모드로 전환한다
-      // (저장·자동 저장은 하지 않음). 화면이 실패를 알리고 '다시 시도'를 제공한다.
+      // (저장·자동 저장은 하지 않음). 화면이 실패를 알리고 '다시 불러오기'를 제공한다.
       usePrefs.getState().setMode("account");
       usePrefs.getState().setSaveStatus("load-error");
     }

@@ -7,7 +7,7 @@ import { areaChipLabel, budgetChipLabel } from "@/lib/chips";
 import { isStale, kstToday } from "@/lib/dates";
 import { buildFeed, regionOptions, type Sort, type Tab } from "@/lib/feed";
 import { loadAll, newProgress, type LoadProgress } from "@/lib/loadAll";
-import { retryAccountSync } from "@/store/account";
+import { retryAccountSync, retrySave } from "@/store/account";
 import { fetchAnnouncementsPage, fetchLastSuccessfulSync, MAX_LOAD, PAGE_SIZE } from "@/lib/queries";
 import { kstDateOf } from "@/lib/summary";
 import { supabaseConfigured } from "@/lib/supabase";
@@ -115,7 +115,10 @@ export default function BrowsePage() {
         <Notice tone="warn">최소 면적이 최대 면적보다 커서 이 조건은 계정에 저장하지 않았습니다. 값을 고치면 다시 저장됩니다.</Notice>
       )}
       {mode === "account" && saveStatus === "error" && (
-        <Notice tone="warn">검색 조건을 계정에 저장하지 못했습니다. 이 화면에서는 적용되지만 다른 기기에는 반영되지 않습니다. 조건을 바꾸면 다시 저장을 시도합니다.</Notice>
+        <Notice tone="warn">
+          검색 조건을 계정에 저장하지 못했습니다. 이 화면에서는 적용되지만 다른 기기에는 반영되지 않습니다.{" "}
+          <button type="button" onClick={() => void retrySave()} className="font-semibold underline">다시 저장</button>
+        </Notice>
       )}
       {!supabaseConfigured && <Notice tone="warn">Supabase 공개 설정이 없어 공고를 불러올 수 없습니다(.env.local 확인).</Notice>}
       {supabaseConfigured && lastSync !== undefined && (

@@ -105,7 +105,8 @@ export const usePrefs = create<State>((set, get) => ({
 
 if (typeof window !== "undefined") {
   usePrefs.subscribe((s) => {
-    if (!s.hydrated || s.mode !== "guest") return; // 복원 전·계정 모드에서는 브라우저에 저장하지 않는다
+    // 복원 전·계정 모드·계정 동기화 중(로그인 직후 조회 대기·충돌 선택 대기)에는 브라우저에 저장하지 않는다
+    if (!s.hydrated || s.mode !== "guest" || s.syncing) return;
     try {
       window.localStorage.setItem(KEY, JSON.stringify({ filters: s.filters, tab: s.tab, sort: s.sort }));
     } catch {

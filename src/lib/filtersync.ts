@@ -11,7 +11,8 @@ export type SyncDecision =
 /** 계정에 저장할 수 있는 값인가(DB 제약과 같은 기준: 최소 면적 ≤ 최대 면적, 음수 없음). */
 const AREA_MAX = 99_999_999.99; // numeric(10,2)의 최대값
 export function filtersSavable(f: Filters): boolean {
-  const area = (v: number | null) => v === null || (Number.isFinite(v) && v > 0 && v <= AREA_MAX); // 스키마: 면적 > 0
+  // 스키마: 면적 > 0 이고 numeric(10,2). 0.001 같은 값은 소수 둘째 자리 반올림으로 0.00이 되어 DB가 거부한다
+  const area = (v: number | null) => v === null || (Number.isFinite(v) && v <= AREA_MAX && Number(v.toFixed(2)) > 0);
   const money = (v: number | null) => v === null || (Number.isInteger(v) && v >= 0 && v <= Number.MAX_SAFE_INTEGER); // bigint 정수, 음수 불가
   if (!area(f.minAreaSqm) || !area(f.maxAreaSqm) || !money(f.budgetMaxKrw)) return false;
   return !(f.minAreaSqm !== null && f.maxAreaSqm !== null && f.minAreaSqm > f.maxAreaSqm);
