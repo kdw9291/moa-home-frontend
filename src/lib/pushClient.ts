@@ -120,12 +120,13 @@ export async function disablePush(opts: { skipIfReenabled?: boolean; keepIfOwned
   try {
     sub = await getDeviceSubscription();
   } catch {
+    if (!(opts.skipIfReenabled && enableInFlight > 0)) disableEpoch += 1; // 상태를 못 읽어도 이미 진행 중인 켜기는 취소한다
     return { browser: false, server: false }; // 구독 상태를 확인하지 못함: 해제됐다고 말하지 않는다
   }
-  if (!sub) return { browser: true, server: true };
   if (opts.keepIfOwnedBy && subOwner !== null && subOwner.userId === opts.keepIfOwnedBy()) return { browser: true, server: true }; // 지금 세션 계정의 구독이면 지우지 않는다
   if (opts.skipIfReenabled && (enableCount !== snap || enableInFlight > 0)) return { browser: true, server: true, skipped: true }; // 새 계정이 켜는 중이거나 켰다면 그 구독을 지우지 않는다
-  disableEpoch += 1; // 이 시점부터 이미 진행 중이던 켜기는 끝나도 구독을 남기지 못한다
+  disableEpoch += 1; // 이 시점부터 이미 진행 중이던 켜기는 끝나도 구독을 남기지 못한다(지금 구독이 없어도 마찬가지)
+  if (!sub) return { browser: true, server: true };
   // 브라우저 구독을 먼저 해제한다: 이것이 이 기기의 알림 수신을 멈춘다
   const browser = await sub.unsubscribe().catch(() => false);
   if (browser) subOwner = null;
