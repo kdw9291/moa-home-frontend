@@ -193,6 +193,19 @@ describe("이전 계정 푸시 정리와 새 계정 켜기의 경합", () => {
     expect(st.subscription).toBeNull(); // 로그아웃한 기기에 구독이 남지 않는다
   });
 
+  it("기기에 구독이 없는 상태에서 한 로그아웃도 멈춰 있던 켜기가 뒤늦게 구독을 만들지 못하게 한다", async () => {
+    const push = await fresh();
+    st.subscription = null; // 알림이 꺼진 상태에서 켜기를 눌렀다
+    let open!: () => void;
+    st.permGate = new Promise<void>((r) => { open = r; });
+    const enabling = push.enablePush("A");
+    await wait();
+    expect((await push.disablePush()).browser).toBe(true); // 구독이 없으니 해제할 것은 없지만 진행 중인 켜기는 취소되어야 한다
+    open();
+    expect((await enabling).ok).toBe(false);
+    expect(st.subscription).toBeNull();
+  });
+
   it("서버 등록까지 끝난 켜기도 그 사이 해제가 있었다면 구독과 서버 행을 되돌린다", async () => {
     const push = await fresh();
     st.hold = true;
