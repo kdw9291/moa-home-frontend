@@ -164,8 +164,40 @@ test.describe("로그인 상태", () => {
     await budget(page).selectOption("6");
     await expect(page.getByText("검색 조건을 계정에 저장하지 못했습니다")).toBeVisible({ timeout: 5000 });
     await expect(page.getByLabel("적용 중인 조건")).toContainText("최고 분양가 6억원 이하"); // 이 화면에는 적용
-    expect(h.filterUpserts.length).toBeGreaterThan(0);
+    expect(h.rpcCalls.length).toBeGreaterThan(0);            // 저장 RPC를 호출했지만 서버가 거절했다
+    expect(h.filterUpserts).toEqual([]);                      // 서버에는 반영되지 않았다
     expect(errors).toEqual([]);
+  });
+
+  test("다른 기기가 먼저 저장해 서버 revision이 앞서면 선택창이 뜨고, 내 조건을 고르면 최신 revision으로 저장한다", async ({ page }) => {
+    const h = await installMock(page, { auth: USER, serverFilters: { [USER.userId]: serverRow() } });
+    await openHome(page);                                      // revision 3을 읽은 상태
+    h.serverFilters[USER.userId] = serverRow({ budget_max_krw: 900_000_000, revision: 7 });   // 다른 기기가 저장
+    await budget(page).selectOption("6");
+    const dialog = page.getByRole("dialog", { name: "어느 검색 조건을 사용할까요?" });
+    await expect(dialog).toBeVisible({ timeout: 5000 });
+    expect(h.filterUpserts).toEqual([]);                       // 선택 전에는 덮어쓰지 않는다
+    await expect(dialog).toContainText("9억");
+    await dialog.getByRole("button", { name: /이 브라우저의 조건/ }).click();
+    await expect.poll(() => h.filterUpserts.at(-1)?.revision, { timeout: 5000 }).toBe(8);
+    expect(h.filterUpserts.at(-1)).toMatchObject({ budget_max_krw: 600_000_000 });
+    expect(h.directFilterWrites).toBe(0);                      // 저장은 RPC로만
+  });
+
+  test("모의 서버 자체 점검: 필터 테이블 직접 쓰기는 본인 것이어도 거부된다(권한 회수)", async ({ page }) => {
+    const h = await installMock(page, { auth: USER, serverFilters: { [USER.userId]: serverRow() } });
+    await openHome(page);
+    const status = await page.evaluate(async ({ key, me }) => {
+      const token = (JSON.parse(localStorage.getItem(key)!) as { access_token: string }).access_token;
+      const r = await fetch("https://selfcheck.example/rest/v1/user_filter_settings?on_conflict=user_id", {
+        method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify({ user_id: me, budget_max_krw: 1, revision: 99 }),
+      });
+      return r.status;
+    }, { key: authStorageKey(), me: USER.userId });
+    expect(status).toBe(403);
+    expect(h.directFilterWrites).toBe(1);
+    expect(h.serverFilters[USER.userId]).toMatchObject({ revision: 3 });   // 서버 행은 그대로
   });
 
   test("계정 조건을 불러오지 못하면 알리고, 그동안 바꾼 조건은 저장·브라우저 보관 없이 두었다가 '다시 불러오기' 뒤 선택창으로 넘긴다", async ({ page }) => {

@@ -83,7 +83,9 @@ function pageOf(rows: ReturnType<typeof toRow>[], url: URL) {
 }
 
 export interface MockHandle {
-  filterUpserts: Record<string, any>[]; // 앱이 보낸 필터 저장 요청 본문
+  filterUpserts: Record<string, any>[]; // 서버에 실제로 반영된 필터 저장(행 형태). 저장 RPC 호출 한 번이 성공하면 한 건이 쌓인다
+  rpcCalls: { id: string; exp: number }[]; // 저장 RPC 호출(요청 ID·예상 revision) 기록
+  directFilterWrites: number; // user_filter_settings 직접 쓰기 시도 수(권한 회수 뒤에는 모두 거부된다)
   bookmarkWrites: { op: "add" | "remove"; id: string }[];
   logoutCalls: number;
   failFilterGet: boolean;
@@ -116,7 +118,8 @@ export async function installMock(page: Page, opts: MockOptions = {}): Promise<M
   const rows = (opts.anns ?? BASE_ANNS).map(toRow);
   let listCalls = 0;
   let failed = false;
-  const handle: MockHandle = { filterUpserts: [], bookmarkWrites: [], logoutCalls: 0, failFilterGet: !!opts.failFilterGet, serverFilters: { ...(opts.serverFilters ?? {}) }, bookmarks: new Set(opts.serverBookmarks ?? []) };
+  const ledger: Record<string, Record<string, { input: string; applied: number; current: unknown }>> = {};
+  const handle: MockHandle = { filterUpserts: [], rpcCalls: [], directFilterWrites: 0, bookmarkWrites: [], logoutCalls: 0, failFilterGet: !!opts.failFilterGet, serverFilters: { ...(opts.serverFilters ?? {}) }, bookmarks: new Set(opts.serverBookmarks ?? []) };
   if (opts.auth) {
     const key = authStorageKey();
     const value = JSON.stringify(fakeSession(opts.auth.userId, opts.auth.email));
@@ -151,7 +154,8 @@ export async function installMock(page: Page, opts: MockOptions = {}): Promise<M
       return json(route, opts.maxRows ? page.slice(0, opts.maxRows) : page);
     }
     const method = route.request().method();
-    const userTable = /\/(user_filter_settings|user_bookmarks|push_subscriptions)$/.test(url.pathname);
+    const isRpc = url.pathname.endsWith("/rpc/save_user_filter_settings");
+    const userTable = isRpc || /\/(user_filter_settings|user_bookmarks|push_subscriptions)$/.test(url.pathname);
     if (userTable) {
       // RLS 흉내: 사용자 토큰(Authorization: Bearer <로그인 세션 토큰>) 없이는 접근할 수 없다. 공개 키만 보내면 401.
       const authz = route.request().headers()["authorization"] ?? "";
@@ -161,12 +165,39 @@ export async function installMock(page: Page, opts: MockOptions = {}): Promise<M
     }
     const sub = opts.auth?.userId ?? "";
     // RLS 흉내(user_id = auth.uid()): 조회 조건·쓰기 본문의 user_id가 토큰 사용자와 다르면 거부한다.
-    const writesBody = userTable && (method === "POST" || method === "PATCH" || method === "PUT");
+    const writesBody = userTable && !isRpc && (method === "POST" || method === "PATCH" || method === "PUT"); // RPC는 user_id 인자가 없다(서버가 JWT로 확정)
     const scopedUid = writesBody ? (() => { try { return (route.request().postDataJSON() as { user_id?: string } | null)?.user_id ?? ""; } catch { return ""; } })() : undefined;
     if (userTable && scopedUid !== undefined && scopedUid !== sub) return json(route, { code: "42501", message: "new row violates row-level security policy" }, 403);
     if (userTable && method === "GET") {
       const q = url.searchParams.get("user_id")?.replace(/^eq\./, "");
       if (q !== undefined && q !== sub) return json(route, url.pathname.endsWith("/user_filter_settings") ? null : [], 200); // RLS는 다른 사용자의 행을 조용히 걸러낸다
+    }
+    if (isRpc && method === "POST") {
+      // 저장 RPC(save_user_filter_settings) 흉내: 예상 revision 비교, 요청 기록 재생, SQLSTATE 오류. 사용자는 토큰(sub)으로 정해진다.
+      const a = route.request().postDataJSON() as Record<string, any>;
+      handle.rpcCalls.push({ id: a.p_request_id, exp: a.p_expected_revision });
+      if (opts.failUpsert) return json(route, { code: "XX000", message: "rejected" }, 400);
+      const view = (r: Record<string, any>) => ({ ...r, budget_max_krw: r.budget_max_krw === null ? null : String(r.budget_max_krw), user_id: undefined });
+      const led = (ledger[sub] ??= {});
+      const input = JSON.stringify({ ...a, p_request_id: undefined });
+      const hit = led[a.p_request_id];
+      if (hit) return hit.input === input ? json(route, { status: "saved", applied_revision: hit.applied, replayed: true, current: hit.current }) : json(route, { code: "22023", message: "request_id reused with different input" }, 400);
+      const row = handle.serverFilters[sub] as Record<string, any> | undefined;
+      const exp = a.p_expected_revision as number;
+      if (row ? row.revision !== exp : exp !== 0) {
+        const empty = { preferred_region_codes: [], budget_max_krw: null, min_area_sqm: null, max_area_sqm: null, housing_families: [], qualification_preferences: [], revision: 0 };
+        return json(route, { status: "conflict", current: row ? view(row) : empty });
+      }
+      const next = {
+        user_id: sub, preferred_region_codes: a.p_preferred_region_codes, budget_max_krw: a.p_budget_max_krw === null ? null : Number(a.p_budget_max_krw),
+        min_area_sqm: a.p_min_area_sqm, max_area_sqm: a.p_max_area_sqm, housing_families: a.p_housing_families,
+        qualification_preferences: a.p_qualification_preferences, revision: exp + 1,
+      };
+      handle.serverFilters[sub] = next;
+      handle.filterUpserts.push(next);
+      const current = view(next);
+      led[a.p_request_id] = { input, applied: next.revision, current };
+      return json(route, { status: "saved", applied_revision: next.revision, replayed: false, current });
     }
     if (url.pathname.endsWith("/user_filter_settings")) {
       if (method === "GET") {
@@ -174,16 +205,10 @@ export async function installMock(page: Page, opts: MockOptions = {}): Promise<M
         const uid = url.searchParams.get("user_id")?.replace(/^eq\./, "") ?? "";
         return json(route, handle.serverFilters[uid] ?? null);
       }
-      if (method === "POST") {
-        const body = route.request().postDataJSON() as Record<string, any>;
-        // upsert 형식: on_conflict=user_id 와 Prefer: resolution=merge-duplicates 가 없으면 PostgREST는 충돌 시 오류를 낸다
-        if (url.searchParams.get("on_conflict") !== "user_id" || !(route.request().headers()["prefer"] ?? "").includes("resolution=merge-duplicates")) {
-          return json(route, { code: "23505", message: "duplicate key (not an upsert request)" }, 409);
-        }
-        handle.filterUpserts.push(body);
-        if (opts.failUpsert) return json(route, { code: "23514", message: "check violation" }, 400);
-        handle.serverFilters[body.user_id] = body;
-        return route.fulfill({ status: 201, body: "", headers: { "access-control-allow-origin": "*" } });
+      if (method === "POST" || method === "PATCH" || method === "PUT" || method === "DELETE") {
+        // 필터 저장은 RPC만 허용한다: authenticated 의 직접 INSERT/UPDATE/DELETE 권한은 회수됐다.
+        handle.directFilterWrites += 1;
+        return json(route, { code: "42501", message: "permission denied for table user_filter_settings" }, 403);
       }
     }
     if (url.pathname.endsWith("/user_bookmarks")) {
