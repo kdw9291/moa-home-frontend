@@ -425,6 +425,7 @@ export async function retryAccountSync(): Promise<void> {
     const gen = epoch;
     const r = await saveLatest(u, gen);
     reportSave(gen, r);
+    if (stale(gen) || currentUser !== u) return; // 확인을 기다리는 동안 계정이 바뀌었다: 이전 계정으로 재동기화하지 않는다
     // 저장 성공으로 확인된 경우에만 재동기화한다. 아직 모르거나(load-error·error로 요청 ID 유지) 서버가 거절했거나(error·invalid: 초안 유지,
     // '다시 저장'으로 이어감) 선택창이 열린 경우에는 서버 값으로 덮지 않는다(예: 사용자가 조건을 전부 지운 초안이 기본값이라 변경 의도로
     // 취급되지 않아 서버 값에 덮이는 일을 막는다).
