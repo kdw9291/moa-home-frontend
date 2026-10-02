@@ -309,6 +309,7 @@ function saveLatest(userId: string, gen: number, afterConflictChoice = false): P
         } catch {
           /* 앞선 재조회 값 사용 */
         }
+        if (stale(gen)) return "ignored"; // 조회가 실패로 끝난 경우에도 그 사이 계정이 바뀌었으면 공유 상태(revision·충돌창)를 건드리지 않는다
       }
       if (latest && latest.revision > out.applied) {
         // 내 요청은 반영됐지만(재생) 그 뒤 다른 기기가 더 새 조건을 저장했다: 서버가 앞서 있으므로 그 값을 덮어쓰지 않고 선택하게 한다.
