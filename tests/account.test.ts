@@ -765,6 +765,88 @@ describe("저장 RPC 계약: 충돌·멱등 재시도·오류 매핑", () => {
   });
 });
 
+describe("저장 RPC: 재리뷰 #1 보완", () => {
+  it("충돌 선택창이 열리면 대기 중이던 자동 저장은 서버 값을 덮어쓰지 않는다", async () => {
+    const { usePrefs, onUserChanged } = await fresh();
+    db.serverRows["A"] = serverRow("A", 100_000_000);
+    await onUserChanged("A");
+    db.serverRows["A"] = { ...serverRow("A", 700_000_000), revision: 4 };   // 다른 기기가 앞서 저장
+    db.holdNextUpsert = true;                                    // 첫 저장(충돌이 날)을 붙잡는다
+    usePrefs.getState().setFilters({ budgetMaxKrw: 200_000_000 });
+    await tick(900);
+    usePrefs.getState().setFilters({ budgetMaxKrw: 210_000_000 }); // 첫 저장이 끝나기 전에 또 바꿔 두 번째 자동 저장이 대기
+    await tick(900);
+    db.releaseUpsert!();                                         // 첫 저장이 충돌로 끝난다
+    await tick(300);
+    expect(usePrefs.getState().conflict).not.toBeNull();
+    expect(db.rpcCalls).toHaveLength(1);                         // 대기 중이던 저장은 보내지 않았다
+    expect(db.upserts).toHaveLength(0);
+    expect((db.serverRows["A"] as { budget_max_krw: number }).budget_max_krw).toBe(700_000_000);   // 서버 값은 그대로
+  });
+
+  it("재생된 내 요청 뒤에 다른 기기가 더 새로 저장했다면 그 값을 덮어쓰지 않고 선택하게 한다", async () => {
+    const { usePrefs, onUserChanged, resolveConflict, setSaveTimeoutForTests } = await fresh();
+    setSaveTimeoutForTests(150);
+    db.serverRows["A"] = serverRow("A", 100_000_000);
+    await onUserChanged("A");
+    db.applyThenHang = true;                                     // 내 저장은 revision 2로 반영되지만 응답이 유실된다
+    usePrefs.getState().setFilters({ budgetMaxKrw: 200_000_000 });
+    await tick(880);                                             // 요청이 나가 반영된 상태(시간 초과 직전)
+    db.serverRows["A"] = { ...serverRow("A", 700_000_000), revision: 3 };   // 다른 기기가 revision 3으로 저장
+    await tick(600);                                             // 시간 초과 -> 재조회 -> 같은 ID 재시도(재생)
+    expect(db.rpcCalls[1]!.id).toBe(db.rpcCalls[0]!.id);
+    expect(usePrefs.getState().conflict).toMatchObject({ local: { budgetMaxKrw: 200_000_000 }, server: { budgetMaxKrw: 700_000_000 } });
+    usePrefs.getState().setFilters({ budgetMaxKrw: 210_000_000 });  // 선택 전에 또 바꿔도 덮어쓰지 않는다
+    await tick(1000);
+    expect((db.serverRows["A"] as { budget_max_krw: number }).budget_max_krw).toBe(700_000_000);
+    await resolveConflict("local");                              // 내 조건(충돌 시점의 조건)을 고르면 revision 3 기준으로 저장
+    await tick();
+    expect(db.upserts.at(-1)).toMatchObject({ budget_max_krw: 200_000_000, revision: 4 });
+  });
+
+  it("load-error의 '다시 불러오기'는 결과를 모르는 요청을 같은 request ID로 먼저 확인한다", async () => {
+    const { usePrefs, onUserChanged, retryAccountSync, setSaveTimeoutForTests } = await fresh();
+    setSaveTimeoutForTests(150);
+    db.serverRows["A"] = serverRow("A", 100_000_000);
+    await onUserChanged("A");
+    db.applyThenHang = true;                                     // 서버에는 반영(revision 2), 응답은 유실
+    usePrefs.getState().setFilters({ budgetMaxKrw: 200_000_000 });
+    await tick(850);
+    db.failGet = true;                                           // 재조회도 실패
+    await tick(500);
+    expect(usePrefs.getState().saveStatus).toBe("load-error");
+    const firstId = db.rpcCalls[0]!.id;
+    db.failGet = false;
+    await retryAccountSync();                                    // '다시 불러오기'
+    await tick(300);
+    expect(db.rpcCalls.at(-1)!.id).toBe(firstId);                // 같은 ID로 확인했다
+    expect(db.upserts).toHaveLength(1);                          // 이중 반영 없음
+    expect(usePrefs.getState().conflict).toBeNull();
+    expect(usePrefs.getState().filters.budgetMaxKrw).toBe(200_000_000);
+    expect(usePrefs.getState().saveStatus).toBe("idle");          // 재동기화가 끝나 오류 표시가 없다
+  });
+
+  it("'다시 불러오기'에서도 재조회가 계속 실패하면 요청 ID를 유지한 채 load-error로 남는다", async () => {
+    const { usePrefs, onUserChanged, retryAccountSync, setSaveTimeoutForTests } = await fresh();
+    setSaveTimeoutForTests(150);
+    db.serverRows["A"] = serverRow("A", 100_000_000);
+    await onUserChanged("A");
+    db.applyThenHang = true;
+    usePrefs.getState().setFilters({ budgetMaxKrw: 200_000_000 });
+    await tick(850);
+    db.failGet = true;
+    await tick(500);
+    await retryAccountSync();                                    // 여전히 재조회 실패
+    expect(usePrefs.getState().saveStatus).toBe("load-error");
+    db.failGet = false;
+    await retryAccountSync();                                    // 복구 뒤에는 같은 ID로 확인하고 동기화한다
+    await tick(300);
+    expect(db.rpcCalls.every((c) => c.id === db.rpcCalls[0]!.id)).toBe(true);
+    expect(db.upserts).toHaveLength(1);
+    expect(usePrefs.getState().saveStatus).toBe("idle");
+  });
+});
+
 // 타입 확인용(사용하지 않음): Filters 형태가 바뀌면 컴파일 단계에서 알 수 있게 한다
 const _shape: Pick<Filters, "budgetMaxKrw"> = { budgetMaxKrw: null };
 void _shape;
