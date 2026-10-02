@@ -218,6 +218,8 @@ function buildRequest(f: Filters, expected: number): SaveRequest {
   };
 }
 
+const EMPTY_ROW: FilterRow = { preferred_region_codes: [], budget_max_krw: null, min_area_sqm: null, max_area_sqm: null, housing_families: [], qualification_preferences: [], revision: 0 };
+
 // 결과를 알 수 없는(시간 초과·네트워크 오류) 직전 요청: 다음 시도에서 재조회한 뒤 같은 request_id·같은 입력으로 다시 보낸다.
 let unknownReq: SaveRequest | null = null;
 
@@ -264,18 +266,21 @@ async function callRpc(req: SaveRequest): Promise<RpcOutcome> {
  * - 결과를 모르는 요청(시간 초과 등): 서버를 재조회한 뒤 같은 request_id·같은 입력으로 한 번 더 보내 이미 반영됐는지 확인한다.
  * 세대가 바뀌었으면(로그아웃·계정 전환) 저장하지 않고 'ignored'를 돌려준다.
  */
-function saveLatest(userId: string, gen: number): Promise<SaveResult> {
+function saveLatest(userId: string, gen: number, afterConflictChoice = false): Promise<SaveResult> {
   const run = async (): Promise<SaveResult> => {
     if (stale(gen) || currentUser !== userId) return "ignored";
+    // 충돌 선택창이 열려 있는 동안에는 대기 중이던 자동 저장이 서버 값을 덮어쓰지 않는다(선택 결과를 저장하는 호출만 예외).
+    if (!afterConflictChoice && usePrefs.getState().conflict) return "ignored";
     const resumed = unknownReq !== null; // 직전 요청의 결과를 모른 채 시작하는가
     let req = unknownReq;
-    let refetched: number | null = null;
+    let refetched: { revision: number; filters: Filters } | null = null;
     let out: RpcOutcome = { kind: "unknown" };
     for (let attempt = 0; attempt < 2; attempt++) {
       if (req) {
         // 직전 요청의 결과를 모른다: 먼저 본인 필터를 재조회한다. 재조회가 실패하면 서버 상태를 모른 채 보내지 않는다.
         try {
-          refetched = (await fetchServer(userId))?.revision ?? 0;
+          const s = await fetchServer(userId);
+          refetched = { revision: s?.revision ?? 0, filters: s?.filters ?? rowToFilters(EMPTY_ROW) };
         } catch {
           return stale(gen) ? "ignored" : "load-error";
         }
@@ -294,7 +299,18 @@ function saveLatest(userId: string, gen: number): Promise<SaveResult> {
     unknownReq = null;
     if (out.kind === "saved") {
       // 재생(replayed)이면 applied_revision 은 원래 요청의 값이라 이후 다른 저장으로 서버가 더 앞서 있을 수 있다: 재조회한 revision 을 우선한다.
-      revision = Math.max(out.applied, refetched ?? 0);
+      if (refetched && refetched.revision > out.applied) {
+        // 내 요청은 반영됐지만(재생) 그 뒤 다른 기기가 더 새 조건을 저장했다: 서버가 앞서 있으므로 그 값을 덮어쓰지 않고 선택하게 한다.
+        revision = refetched.revision;
+        const local = usePrefs.getState().filters;
+        if (sameFilters(local, refetched.filters)) {
+          lastSaved = local;
+          return "saved";
+        }
+        usePrefs.getState().setConflict({ local, server: refetched.filters });
+        return "conflict";
+      }
+      revision = out.applied;
       lastSaved = req!.filters;
       // 결과를 모르던 요청을 마무리하는 동안 사용자가 조건을 더 바꿨다면, 그 최신 조건도 이어서 저장한다(새 요청).
       if (resumed && !sameFilters(usePrefs.getState().filters, req!.filters)) return run();
@@ -372,7 +388,7 @@ export async function resolveConflict(choice: "local" | "server"): Promise<void>
   let saved: Filters | undefined;
   if (choice === "local") {
     writePending(userId, chosen); // 저장이 끝나기 전에 탭이 닫혀도 선택한 조건을 잃지 않게 먼저 남기고, 저장 성공 때 지운다
-    const r = await saveLatest(userId, gen);
+    const r = await saveLatest(userId, gen, true);
     reportSave(gen, r);
     if (r === "conflict") return; // 그 사이 서버가 또 바뀌었다: 새 충돌 선택창을 그대로 둔다
     if (r === "saved") saved = lastSaved ?? undefined;
@@ -392,6 +408,13 @@ export async function resolveConflict(choice: "local" | "server"): Promise<void>
 export async function retryAccountSync(): Promise<void> {
   const u = currentUser;
   if (!u) return;
+  if (unknownReq) {
+    // 결과를 모르는 저장이 남아 있으면 같은 request ID로 먼저 확인한다(재동기화가 그 ID를 버리면 늦게 도착한 요청이 서버 값을 바꿀 수 있다).
+    const gen = epoch;
+    const r = await saveLatest(u, gen);
+    reportSave(gen, r);
+    if (r === "load-error" || r === "conflict" || r === "ignored") return; // 아직 확인하지 못했거나 이미 선택창이 열렸다
+  }
   const inMemory = usePrefs.getState().filters;
   currentUser = null;
   await onUserChanged(u, { localOverride: inMemory });
