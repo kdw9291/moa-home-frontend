@@ -299,15 +299,26 @@ function saveLatest(userId: string, gen: number, afterConflictChoice = false): P
     unknownReq = null;
     if (out.kind === "saved") {
       // 재생(replayed)이면 applied_revision 은 원래 요청의 값이라 이후 다른 저장으로 서버가 더 앞서 있을 수 있다: 재조회한 revision 을 우선한다.
-      if (refetched && refetched.revision > out.applied) {
+      let latest = refetched;
+      if (refetched) {
+        // 재조회와 재생 사이에 서버가 더 바뀌었을 수 있으니, 결과를 받은 직후 한 번 더 읽어 최신 값으로 비교한다(실패하면 앞선 재조회 값을 쓴다).
+        try {
+          const s = await fetchServer(userId);
+          if (stale(gen)) return "ignored";
+          latest = { revision: s?.revision ?? 0, filters: s?.filters ?? rowToFilters(EMPTY_ROW) };
+        } catch {
+          /* 앞선 재조회 값 사용 */
+        }
+      }
+      if (latest && latest.revision > out.applied) {
         // 내 요청은 반영됐지만(재생) 그 뒤 다른 기기가 더 새 조건을 저장했다: 서버가 앞서 있으므로 그 값을 덮어쓰지 않고 선택하게 한다.
-        revision = refetched.revision;
+        revision = latest.revision;
         const local = usePrefs.getState().filters;
-        if (sameFilters(local, refetched.filters)) {
+        if (sameFilters(local, latest.filters)) {
           lastSaved = local;
           return "saved";
         }
-        usePrefs.getState().setConflict({ local, server: refetched.filters });
+        usePrefs.getState().setConflict({ local, server: latest.filters });
         return "conflict";
       }
       revision = out.applied;
@@ -413,7 +424,10 @@ export async function retryAccountSync(): Promise<void> {
     const gen = epoch;
     const r = await saveLatest(u, gen);
     reportSave(gen, r);
-    if (r === "load-error" || r === "conflict" || r === "ignored") return; // 아직 확인하지 못했거나 이미 선택창이 열렸다
+    // 저장 성공으로 확인된 경우에만 재동기화한다. 아직 모르거나(load-error·error로 요청 ID 유지) 서버가 거절했거나(error·invalid: 초안 유지,
+    // '다시 저장'으로 이어감) 선택창이 열린 경우에는 서버 값으로 덮지 않는다(예: 사용자가 조건을 전부 지운 초안이 기본값이라 변경 의도로
+    // 취급되지 않아 서버 값에 덮이는 일을 막는다).
+    if (r !== "saved") return;
   }
   const inMemory = usePrefs.getState().filters;
   currentUser = null;
