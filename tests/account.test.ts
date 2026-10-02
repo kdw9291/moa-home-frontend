@@ -940,6 +940,33 @@ describe("저장 RPC: 재리뷰 #3 보완", () => {
     expect(db.rpcCalls.at(-1)!.exp).toBe(0);
     expect(db.upserts.at(-1)).toMatchObject({ user_id: "B", budget_max_krw: 300_000_000, revision: 1 });
   });
+
+  it("'다시 불러오기'의 미확인 요청 확인을 기다리는 동안 계정이 바뀌면 이전 계정으로 재동기화하지 않는다", async () => {
+    const { usePrefs, onUserChanged, retryAccountSync, setSaveTimeoutForTests } = await fresh();
+    setSaveTimeoutForTests(150);
+    db.serverRows["A"] = serverRow("A", 100_000_000);
+    await onUserChanged("A");
+    db.applyThenHang = true;
+    usePrefs.getState().setFilters({ budgetMaxKrw: 200_000_000 });
+    await tick(850);
+    db.failGet = true;
+    await tick(500);                                             // A: load-error(요청 결과 미확인)
+    db.failGet = false;
+    db.holdNextUpsert = true;                                    // '다시 불러오기'의 확인 요청을 붙잡는다
+    const retry = retryAccountSync();
+    await tick(50);
+    await onUserChanged("B");                                    // 그 사이 B로 전환(B의 서버 행은 없음)
+    await tick(50);
+    db.releaseUpsert!();                                         // A의 확인이 이제야 끝난다
+    await retry;
+    await tick(100);
+    expect(db.lastFetchUser).toBe("B");                          // A로 재동기화(조회)하지 않았다
+    expect(usePrefs.getState().filters.budgetMaxKrw).toBeNull();
+    expect(usePrefs.getState().conflict).toBeNull();
+    usePrefs.getState().setFilters({ budgetMaxKrw: 300_000_000 });   // B의 저장은 B 계정으로 나간다
+    await tick(1200);
+    expect(db.upserts.at(-1)).toMatchObject({ user_id: "B", budget_max_krw: 300_000_000, revision: 1 });
+  });
 });
 
 // 타입 확인용(사용하지 않음): Filters 형태가 바뀌면 컴파일 단계에서 알 수 있게 한다
