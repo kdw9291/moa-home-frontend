@@ -14,6 +14,7 @@ const db = {
   applyThenHang: false, // 다음 저장은 서버에 반영되지만 응답이 오지 않는다(시간 초과 뒤 재시도 시나리오)
   beforeApply: null as null | ((callNo: number) => void), // 저장 RPC가 서버에서 처리되기 직전에 호출된다(그 사이 다른 기기의 저장을 흉내)
   holdGet: false,
+  holdGetFail: false, // 붙잡아 둔 조회를 풀 때 오류로 끝낸다
   failUpsert: false as boolean | string, // 서버가 SQLSTATE 오류로 거절한다(true면 XX000, 문자열이면 그 코드, "network"면 코드 없는 네트워크 오류)
   releaseGet: null as null | (() => void),
   failGet: false,
@@ -62,7 +63,7 @@ vi.mock("@/lib/supabase", () => ({
               const snapshot = db.serverRows[userId] ?? null; // 요청 시점의 서버 상태
               if (db.holdGet) {
                 db.holdGet = false;
-                return new Promise((res) => (db.releaseGet = () => res({ data: snapshot, error: null }))); // 늦게 도착하는 응답
+                return new Promise((res) => (db.releaseGet = () => res(db.holdGetFail ? { data: null, error: { message: "service down" } } : { data: snapshot, error: null }))); // 늦게 도착하는 응답
               }
               return Promise.resolve({ data: snapshot, error: null });
             },
@@ -125,6 +126,7 @@ beforeEach(() => {
   db.rpcCalls = [];
   db.applyThenHang = false;
   db.beforeApply = null;
+  db.holdGetFail = false;
   db.lastFetchUser = "";
   db.releaseUpsert = null;
   db.holdNextUpsert = false;
@@ -908,6 +910,35 @@ describe("저장 RPC: 재리뷰 #2 보완", () => {
     expect(usePrefs.getState().saveStatus).toBe("error");
     expect(usePrefs.getState().filters.budgetMaxKrw).toBeNull();   // 서버의 5억으로 되돌리지 않는다
     expect(store["moahome.pending.v2:A"]).toBeDefined();
+  });
+});
+
+describe("저장 RPC: 재리뷰 #3 보완", () => {
+  it("재생 뒤 추가 조회가 늦다가 실패하는 동안 계정이 바뀌어도 이전 계정의 값이 새 계정에 들어가지 않는다", async () => {
+    const { usePrefs, onUserChanged, setSaveTimeoutForTests } = await fresh();
+    setSaveTimeoutForTests(150);
+    db.serverRows["A"] = serverRow("A", 100_000_000);
+    await onUserChanged("A");
+    db.applyThenHang = true;                                     // A의 저장: revision 2로 반영되지만 응답 유실
+    usePrefs.getState().setFilters({ budgetMaxKrw: 200_000_000 });
+    await tick(880);
+    db.serverRows["A"] = { ...serverRow("A", 700_000_000), revision: 3 };   // 다른 기기가 revision 3으로 저장(재조회가 읽을 값)
+    db.beforeApply = (n) => {                                    // 재생(2번째 호출) 직전에, 이어질 추가 조회를 붙잡아 둔다
+      if (n === 2) { db.holdGet = true; db.holdGetFail = true; }
+    };
+    await tick(500);                                             // 시간 초과 -> 재조회(rev 3) -> 재생 -> 추가 조회(대기 중)
+    expect(db.rpcCalls).toHaveLength(2);
+    await onUserChanged("B");                                    // 그 사이 B로 전환(B의 서버 행은 없음)
+    await tick(50);
+    db.releaseGet!();                                            // A의 추가 조회가 이제 오류로 끝난다
+    await tick(200);
+    const s = usePrefs.getState();
+    expect(s.conflict).toBeNull();                               // A의 필터로 B의 충돌창이 열리지 않는다
+    expect(s.filters.budgetMaxKrw).toBeNull();
+    usePrefs.getState().setFilters({ budgetMaxKrw: 300_000_000 });   // B의 첫 저장은 B 기준 revision 0이어야 한다(A의 revision 3이 새지 않음)
+    await tick(1200);
+    expect(db.rpcCalls.at(-1)!.exp).toBe(0);
+    expect(db.upserts.at(-1)).toMatchObject({ user_id: "B", budget_max_krw: 300_000_000, revision: 1 });
   });
 });
 
