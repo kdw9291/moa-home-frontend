@@ -23,7 +23,7 @@ interface Row {
 
 const num = (v: number | string | null): number | null => (v === null || v === "" ? null : Number.isFinite(Number(v)) ? Number(v) : null);
 
-export function rowToFilters(r: Row): Filters {
+export function rowToFilters(r: Omit<Row, "user_id">): Filters {
   const q = r.qualification_preferences ?? [];
   return sanitizePrefs({
     filters: {
@@ -164,24 +164,94 @@ async function fetchServer(userId: string): Promise<{ filters: Filters; revision
   return data ? { filters: rowToFilters(data as Row), revision: (data as Row).revision } : null;
 }
 
-type SaveResult = "saved" | "error" | "invalid" | "ignored";
+type SaveResult = "saved" | "error" | "invalid" | "load-error" | "conflict" | "ignored";
 
-/** upsert 한 번: 시간 제한을 두고, 제한을 넘기면 요청을 중단한다(abortSignal을 지원하면 사용). */
-async function upsertWithTimeout(row: Row): Promise<{ error: unknown }> {
+// ---- 필터 저장 RPC(public.save_user_filter_settings) -----------------------------------------------------------------
+// 서버가 expected_revision 으로 원자적으로 비교·갱신하고, request_id 로 시간 초과 뒤 재시도를 멱등 처리한다(docs/API_SPEC.md).
+type FilterRow = Omit<Row, "user_id">;
+
+interface RpcArgs {
+  p_preferred_region_codes: string[];
+  p_budget_max_krw: string | null; // 안전 정수를 넘는 값도 잃지 않도록 십진 문자열로 보낸다
+  p_min_area_sqm: number | null;
+  p_max_area_sqm: number | null;
+  p_housing_families: string[];
+  p_qualification_preferences: string[];
+  p_expected_revision: number;
+  p_request_id: string;
+}
+
+interface SaveRequest {
+  args: RpcArgs;
+  filters: Filters; // 이 요청이 저장하려는 조건(성공 때 lastSaved)
+}
+
+type RpcOutcome =
+  | { kind: "saved"; applied: number; replayed: boolean }
+  | { kind: "conflict"; current: FilterRow }
+  | { kind: "invalid" | "error" | "unknown" };
+
+function newRequestId(): string {
+  const c = globalThis.crypto;
+  if (typeof c?.randomUUID === "function") return c.randomUUID();
+  const b = c.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6]! & 0x0f) | 0x40;
+  b[8] = (b[8]! & 0x3f) | 0x80;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+function buildRequest(f: Filters, expected: number): SaveRequest {
+  const row = filtersToRow("", f, expected);
+  return {
+    filters: f,
+    args: {
+      p_preferred_region_codes: row.preferred_region_codes,
+      p_budget_max_krw: row.budget_max_krw === null ? null : String(row.budget_max_krw),
+      p_min_area_sqm: row.min_area_sqm as number | null,
+      p_max_area_sqm: row.max_area_sqm as number | null,
+      p_housing_families: row.housing_families,
+      p_qualification_preferences: row.qualification_preferences,
+      p_expected_revision: expected,
+      p_request_id: newRequestId(),
+    },
+  };
+}
+
+// 결과를 알 수 없는(시간 초과·네트워크 오류) 직전 요청: 다음 시도에서 재조회한 뒤 같은 request_id·같은 입력으로 다시 보낸다.
+let unknownReq: SaveRequest | null = null;
+
+/** SQLSTATE가 있는 응답은 서버가 판단한 결과다. 22023/22003/23514는 입력 문제(invalid), 나머지는 서버·권한 오류(error). 코드가 없으면 결과를 알 수 없다. */
+function classifyError(e: { code?: string } | null | undefined): RpcOutcome {
+  const code = e?.code ?? "";
+  if (code === "22023" || code === "22003" || code === "23514") return { kind: "invalid" };
+  return code ? { kind: "error" } : { kind: "unknown" };
+}
+
+/** RPC 한 번: 시간 제한을 두고, 제한을 넘기면 요청을 중단하고 '알 수 없음'으로 본다(이미 반영됐을 수 있다). */
+async function callRpc(req: SaveRequest): Promise<RpcOutcome> {
   const ctrl = new AbortController();
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<{ error: unknown }>((resolve) => {
+  const timeout = new Promise<{ timedOut: true }>((resolve) => {
     timeoutId = setTimeout(() => {
       ctrl.abort();
-      resolve({ error: new Error("timeout") });
+      resolve({ timedOut: true });
     }, saveTimeoutMs);
   });
   try {
-    const q = supabase!.from("user_filter_settings").upsert(row, { onConflict: "user_id" }) as unknown as PromiseLike<{ error: unknown }> & { abortSignal?: (s: AbortSignal) => PromiseLike<{ error: unknown }> };
-    const req = typeof q.abortSignal === "function" ? q.abortSignal(ctrl.signal) : q;
-    return await Promise.race([Promise.resolve(req), timeout]);
-  } catch (e) {
-    return { error: e };
+    const q = supabase!.rpc("save_user_filter_settings", req.args) as unknown as PromiseLike<{ data: unknown; error: { code?: string } | null }> & {
+      abortSignal?: (s: AbortSignal) => PromiseLike<{ data: unknown; error: { code?: string } | null }>;
+    };
+    const call = typeof q.abortSignal === "function" ? q.abortSignal(ctrl.signal) : q;
+    const res = await Promise.race([Promise.resolve(call), timeout]);
+    if ("timedOut" in res) return { kind: "unknown" };
+    if (res.error) return classifyError(res.error);
+    const d = res.data as { status?: string; applied_revision?: number; replayed?: boolean; current?: FilterRow } | null;
+    if (d?.status === "saved" && Number.isInteger(d.applied_revision)) return { kind: "saved", applied: d.applied_revision!, replayed: !!d.replayed };
+    if (d?.status === "conflict" && d.current) return { kind: "conflict", current: d.current };
+    return { kind: "error" };
+  } catch {
+    return { kind: "unknown" }; // 네트워크 오류 등: 서버에 도달했는지 모른다
   } finally {
     clearTimeout(timeoutId);
   }
@@ -189,29 +259,68 @@ async function upsertWithTimeout(row: Row): Promise<{ error: unknown }> {
 
 /**
  * 저장은 한 번에 하나씩 순서대로 실행하고, 저장할 값은 '실행 시점의 최신 필터'를 읽는다.
- * 그래서 느린 이전 저장이 나중 저장을 덮어쓰지 못하고, 개정 번호도 순서대로 증가한다.
+ * 서버가 예상 revision 이 같을 때만 갱신하므로 늦게 도착한 오래된 요청·다른 탭의 저장이 덮어쓰지 못한다.
+ * - conflict: 서버 값(응답의 current)과 내 조건을 충돌 선택창으로 넘긴다(초안은 유지).
+ * - 결과를 모르는 요청(시간 초과 등): 서버를 재조회한 뒤 같은 request_id·같은 입력으로 한 번 더 보내 이미 반영됐는지 확인한다.
  * 세대가 바뀌었으면(로그아웃·계정 전환) 저장하지 않고 'ignored'를 돌려준다.
  */
 function saveLatest(userId: string, gen: number): Promise<SaveResult> {
-  const job: Promise<SaveResult> = queue.then(async () => {
+  const run = async (): Promise<SaveResult> => {
     if (stale(gen) || currentUser !== userId) return "ignored";
-    const f = usePrefs.getState().filters;
-    if (!filtersSavable(f)) return "invalid"; // DB 제약에 걸릴 값은 서버로 보내지 않는다
-    const next = revision + 1;
-    const { error } = await upsertWithTimeout(filtersToRow(userId, f, next));
-    if (stale(gen)) return "ignored"; // 저장 중 계정이 바뀜: 새 세대의 개정 번호·상태를 건드리지 않는다
-    if (error) return "error";
-    revision = next;
-    lastSaved = f;
-    return "saved";
-  });
+    const resumed = unknownReq !== null; // 직전 요청의 결과를 모른 채 시작하는가
+    let req = unknownReq;
+    let refetched: number | null = null;
+    let out: RpcOutcome = { kind: "unknown" };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (req) {
+        // 직전 요청의 결과를 모른다: 먼저 본인 필터를 재조회한다. 재조회가 실패하면 서버 상태를 모른 채 보내지 않는다.
+        try {
+          refetched = (await fetchServer(userId))?.revision ?? 0;
+        } catch {
+          return stale(gen) ? "ignored" : "load-error";
+        }
+        if (stale(gen)) return "ignored";
+      } else {
+        const f = usePrefs.getState().filters;
+        if (!filtersSavable(f)) return "invalid"; // DB 제약에 걸릴 값은 서버로 보내지 않는다
+        req = buildRequest(f, revision);
+      }
+      out = await callRpc(req);
+      if (stale(gen)) return "ignored"; // 저장 중 계정이 바뀜: 새 세대의 개정 번호·상태를 건드리지 않는다
+      if (out.kind !== "unknown") break;
+      unknownReq = req; // 결과를 모른다: 같은 request_id·입력으로 재확인한다
+    }
+    if (out.kind === "unknown") return "error";
+    unknownReq = null;
+    if (out.kind === "saved") {
+      // 재생(replayed)이면 applied_revision 은 원래 요청의 값이라 이후 다른 저장으로 서버가 더 앞서 있을 수 있다: 재조회한 revision 을 우선한다.
+      revision = Math.max(out.applied, refetched ?? 0);
+      lastSaved = req!.filters;
+      // 결과를 모르던 요청을 마무리하는 동안 사용자가 조건을 더 바꿨다면, 그 최신 조건도 이어서 저장한다(새 요청).
+      if (resumed && !sameFilters(usePrefs.getState().filters, req!.filters)) return run();
+      return "saved";
+    }
+    if (out.kind === "conflict") {
+      revision = out.current.revision;
+      const server = rowToFilters(out.current);
+      const local = usePrefs.getState().filters;
+      if (sameFilters(local, server)) {
+        lastSaved = local; // 서버가 이미 같은 조건이다
+        return "saved";
+      }
+      usePrefs.getState().setConflict({ local, server });
+      return "conflict";
+    }
+    return out.kind; // invalid | error
+  };
+  const job: Promise<SaveResult> = queue.then(run);
   queue = job.catch(() => undefined);
   return job.catch(() => "error" as const);
 }
 
 function reportSave(gen: number, r: SaveResult) {
   if (r === "ignored" || stale(gen)) return;
-  usePrefs.getState().setSaveStatus(r);
+  usePrefs.getState().setSaveStatus(r === "conflict" ? "idle" : r); // 충돌은 선택창이 안내한다
   // 저장 성공: 저장된 값과 같은 초안만 지운다(저장하는 사이 더 바뀐 값이나 다른 탭의 더 새로운 초안은 남는다). 실패·invalid는 초안을 그대로 둔다.
   if (currentUser && r === "saved") clearPending(currentUser, lastSaved ?? undefined);
 }
@@ -265,6 +374,7 @@ export async function resolveConflict(choice: "local" | "server"): Promise<void>
     writePending(userId, chosen); // 저장이 끝나기 전에 탭이 닫혀도 선택한 조건을 잃지 않게 먼저 남기고, 저장 성공 때 지운다
     const r = await saveLatest(userId, gen);
     reportSave(gen, r);
+    if (r === "conflict") return; // 그 사이 서버가 또 바뀌었다: 새 충돌 선택창을 그대로 둔다
     if (r === "saved") saved = lastSaved ?? undefined;
   } else {
     clearPending(userId);
@@ -301,6 +411,7 @@ export async function onUserChanged(userId: string | null, opts: { localOverride
   const gen = epoch;
   revision = 0;
   lastSaved = null;
+  unknownReq = null;
   if (!userId) {
     if (hadUser) {
       usePrefs.getState().resetToGuest();
