@@ -12,6 +12,7 @@ const db = {
   releaseUpsert: null as null | (() => void),
   holdNextUpsert: false, // 다음 저장 요청의 응답을 붙잡는다(해제할 때 반영 후 응답)
   applyThenHang: false, // 다음 저장은 서버에 반영되지만 응답이 오지 않는다(시간 초과 뒤 재시도 시나리오)
+  beforeApply: null as null | ((callNo: number) => void), // 저장 RPC가 서버에서 처리되기 직전에 호출된다(그 사이 다른 기기의 저장을 흉내)
   holdGet: false,
   failUpsert: false as boolean | string, // 서버가 SQLSTATE 오류로 거절한다(true면 XX000, 문자열이면 그 코드, "network"면 코드 없는 네트워크 오류)
   releaseGet: null as null | (() => void),
@@ -72,6 +73,7 @@ vi.mock("@/lib/supabase", () => ({
     rpc: (name: string, a: Row) => {
       if (name !== "save_user_filter_settings") throw new Error("unexpected rpc " + name);
       db.rpcCalls.push({ id: a.p_request_id, exp: a.p_expected_revision });
+      db.beforeApply?.(db.rpcCalls.length);
       const user = db.lastFetchUser;
       let p: Promise<{ data: unknown; error: unknown }>;
       if (db.failUpsert) p = Promise.resolve({ data: null, error: { code: db.failUpsert === "network" ? "" : db.failUpsert === true ? "XX000" : db.failUpsert, message: "rejected" } });
@@ -122,6 +124,7 @@ beforeEach(() => {
   db.ledger = {};
   db.rpcCalls = [];
   db.applyThenHang = false;
+  db.beforeApply = null;
   db.lastFetchUser = "";
   db.releaseUpsert = null;
   db.holdNextUpsert = false;
@@ -844,6 +847,67 @@ describe("저장 RPC: 재리뷰 #1 보완", () => {
     expect(db.rpcCalls.every((c) => c.id === db.rpcCalls[0]!.id)).toBe(true);
     expect(db.upserts).toHaveLength(1);
     expect(usePrefs.getState().saveStatus).toBe("idle");
+  });
+});
+
+describe("저장 RPC: 재리뷰 #2 보완", () => {
+  it("재조회와 재생 사이에 다른 기기가 또 저장해도 선택창은 재생 직후의 최신 서버 값을 보여준다", async () => {
+    const { usePrefs, onUserChanged, setSaveTimeoutForTests } = await fresh();
+    setSaveTimeoutForTests(150);
+    db.serverRows["A"] = serverRow("A", 100_000_000);
+    await onUserChanged("A");
+    db.applyThenHang = true;                                     // 내 저장: revision 2로 반영, 응답 유실
+    usePrefs.getState().setFilters({ budgetMaxKrw: 200_000_000 });
+    await tick(880);
+    db.serverRows["A"] = { ...serverRow("A", 700_000_000), revision: 3 };   // 재조회가 읽을 값(revision 3)
+    db.beforeApply = (n) => {                                    // 재생(2번째 호출)이 처리되기 직전에 다른 기기가 revision 4를 저장
+      if (n === 2) db.serverRows["A"] = { ...serverRow("A", 800_000_000), revision: 4 };
+    };
+    await tick(700);
+    expect(usePrefs.getState().conflict).toMatchObject({ local: { budgetMaxKrw: 200_000_000 }, server: { budgetMaxKrw: 800_000_000 } });   // 3억이 아니라 최신(4)
+  });
+
+  it("'다시 불러오기'의 확인이 계속 불확실하면 재동기화하지 않고 요청 ID를 유지하며, 이후 '다시 저장'이 같은 ID로 마무리한다", async () => {
+    const { usePrefs, onUserChanged, retryAccountSync, retrySave, setSaveTimeoutForTests } = await fresh();
+    setSaveTimeoutForTests(150);
+    db.serverRows["A"] = serverRow("A", 100_000_000);
+    await onUserChanged("A");
+    db.applyThenHang = true;
+    usePrefs.getState().setFilters({ budgetMaxKrw: 200_000_000 });
+    await tick(850);
+    db.failGet = true;
+    await tick(500);                                             // load-error
+    db.failGet = false;
+    db.failUpsert = "network";                                   // 확인 요청이 계속 불확실
+    await retryAccountSync();
+    expect(usePrefs.getState().saveStatus).toBe("error");
+    expect(usePrefs.getState().filters.budgetMaxKrw).toBe(200_000_000);   // 서버 값(2억은 이미 반영됐지만 모르는 상태)으로 덮지 않는다
+    expect(store["moahome.pending.v2:A"]).toContain("200000000");
+    db.failUpsert = false;
+    await retrySave();                                           // 서버가 복구된 뒤 같은 ID로 마무리
+    await tick(100);
+    expect(db.rpcCalls.every((c) => c.id === db.rpcCalls[0]!.id)).toBe(true);
+    expect(db.upserts).toHaveLength(1);
+    expect(usePrefs.getState().saveStatus).toBe("saved");
+  });
+
+  it("'다시 불러오기'의 확인이 서버 거절로 끝나면 서버 값으로 덮지 않고 초안을 유지한다(전부 지운 초안 포함)", async () => {
+    const { usePrefs, onUserChanged, retryAccountSync, setSaveTimeoutForTests } = await fresh();
+    setSaveTimeoutForTests(150);
+    db.serverRows["A"] = serverRow("A", 500_000_000);
+    await onUserChanged("A");
+    db.applyThenHang = true;
+    usePrefs.getState().setFilters({ budgetMaxKrw: null });      // 조건을 전부 지움(기본 조건)
+    await tick(850);
+    db.failGet = true;
+    await tick(500);                                             // load-error
+    db.failGet = false;
+    db.serverRows["A"] = serverRow("A", 500_000_000);            // 서버는 아직 이전 값(요청이 반영되지 않은 상황)
+    db.failUpsert = "XX000";                                     // 확인 요청을 서버가 거절
+    await retryAccountSync();
+    expect(usePrefs.getState().saveStatus).toBe("error");
+    expect(usePrefs.getState().filters.budgetMaxKrw).toBeNull();   // 서버의 5억으로 되돌리지 않는다
+    expect(store["moahome.pending.v2:A"]).toBeDefined();
   });
 });
 
