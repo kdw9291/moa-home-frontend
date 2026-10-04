@@ -44,3 +44,5 @@ docs/
 # 빌드가 만드는 파일
 next-env.d.ts
 *.tsbuildinfo
+# 에이전트 지침 문서는 소스 저장소 밖에서 관리한다(로컬 파일은 유지)
+CLAUDE.md
