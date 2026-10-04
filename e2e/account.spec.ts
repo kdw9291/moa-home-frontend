@@ -86,7 +86,7 @@ test.describe("로그인 상태", () => {
     const h = await installMock(page, { auth: USER, serverFilters: { [USER.userId]: serverRow({ budget_max_krw: null }) } });
     await openHome(page);
     await page.getByRole("button", { name: /소형/ }).click();
-    await page.locator('[aria-label="전용면적 표시 단위"]:visible').first().getByRole("button", { name: "평" }).click();
+    await page.locator('[aria-label="면적 표시 단위"]:visible').first().getByRole("button", { name: "평" }).click();
     await expect.poll(() => h.filterUpserts.at(-1)?.qualification_preferences, { timeout: 5000 }).toEqual(expect.arrayContaining(["_ui:max_excl", "_ui:unit:pyeong"]));
     expect(h.filterUpserts.at(-1)).toMatchObject({ max_area_sqm: 59, min_area_sqm: null });
     await page.reload();

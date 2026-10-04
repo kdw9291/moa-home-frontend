@@ -6,7 +6,7 @@ import { BASE_ANNS, bulkAnns, installMock } from "./mock";
 const names = (page: Page) => page.locator("article h3").allInnerTexts();
 const summaryLine = (page: Page) => page.locator("p[aria-live=polite]");
 const budget = (page: Page) => page.locator('select[aria-label="예산 상한(억원)"]:visible');
-const unitGroup = (page: Page) => page.locator('[aria-label="전용면적 표시 단위"]:visible').first();
+const unitGroup = (page: Page) => page.locator('[aria-label="면적 표시 단위"]:visible').first();
 const areaInputs = (page: Page) => page.locator("input[inputmode=decimal]:visible");
 const tab = (page: Page, label: string) => page.getByRole("button", { name: new RegExp(label) });
 
@@ -70,6 +70,19 @@ test.describe("탐색 화면", () => {
       expect(after).toEqual(before);
       const stored = await page.evaluate(() => JSON.parse(localStorage.getItem("moahome.prefs.v1")!).filters);
       expect(stored).toMatchObject({ minAreaSqm: 59, maxAreaSqm: 84, areaUnit: "pyeong", budgetMaxKrw: 600_000_000 });
+    });
+
+    test("㎡↔평 전환은 공고 카드의 공급면적도 함께 바꾸고, 다시 ㎡로 돌리면 원래대로 돌아온다", async ({ page }) => {
+      await installMock(page);
+      await open(page);
+      const card = page.locator("article").filter({ hasText: "테스트 일치 단지" });
+      await expect(card).toContainText("공급면적 110.5㎡");              // 원천 공급면적 110.5㎡
+      await unitGroup(page).getByRole("button", { name: "평" }).click();
+      await expect(card).toContainText("공급면적 약 33.4평");             // 110.5 / 3.305785 = 33.42
+      await expect(card).not.toContainText("110.5㎡");                   // ㎡ 값이 남아 있지 않다
+      await unitGroup(page).getByRole("button", { name: "㎡" }).click();
+      await expect(card).toContainText("공급면적 110.5㎡");
+      await expect(card).not.toContainText("평");
     });
 
     test("평 표시값을 건드리지 않고 입력칸을 벗어나도 ㎡ 조건이 바뀌지 않는다", async ({ page }) => {
@@ -237,6 +250,21 @@ test.describe("비회원 북마크와 로그인 대화상자", () => {
 test.describe("상세 화면", () => {
   const first = BASE_ANNS[0]!;
   const key = first.id.slice(-6);
+
+  test("㎡↔평 전환은 상세의 공급면적(요약·주택형 표)도 함께 바꾼다", async ({ page }) => {
+    await installMock(page);
+    await page.goto(`/detail/?f=apt&h=${key}&p=${key}`);
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText(first.name);
+    await expect(page.locator("dl").first()).toContainText("110.5㎡");
+    await expect(page.locator("table")).toContainText("110.5㎡");
+    await unitGroup(page).getByRole("button", { name: "평" }).click();
+    await expect(page.locator("dl").first()).toContainText("약 33.4평");
+    await expect(page.locator("table")).toContainText("약 33.4평");
+    await expect(page.locator("dl").first()).not.toContainText("110.5㎡");
+    await expect(page.locator("table")).not.toContainText("110.5㎡");
+    await page.reload();                                              // 선택한 단위는 새로고침 뒤에도 유지된다
+    await expect(page.locator("table")).toContainText("약 33.4평");
+  });
 
   test("직접 URL로 열리고 주택형·일정·공식 링크가 보인다", async ({ page }) => {
     await installMock(page);
