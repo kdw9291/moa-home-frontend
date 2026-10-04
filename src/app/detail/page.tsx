@@ -11,7 +11,7 @@ import { safeOfficialUrl } from "@/lib/links";
 import { formatKrw } from "@/lib/money";
 import { fetchAnnouncement, type DetailAnnouncement } from "@/lib/queries";
 import { kstDateOf, summarizeHousing } from "@/lib/summary";
-import { formatSqm, toNumber } from "@/lib/units";
+import { toNumber } from "@/lib/units";
 import type { Family } from "@/lib/types";
 import { usePrefs } from "@/store/prefs";
 
@@ -115,7 +115,7 @@ function DetailView() {
             <Row label="전용면적">
               {hasExclusive ? `전용 ${s.exclusiveMin === s.exclusiveMax ? areaValueText(s.exclusiveMin!, unit) : `${areaValueText(s.exclusiveMin!, unit)} ~ ${areaValueText(s.exclusiveMax!, unit)}`}` : <Unknown>확인 필요</Unknown>}
             </Row>
-            <Row label="공급면적">{s.supplyMin !== null ? (s.supplyMin === s.supplyMax ? formatSqm(s.supplyMin) : `${formatSqm(s.supplyMin)} ~ ${formatSqm(s.supplyMax!)}`) : <span className="text-muted">제공 정보 없음</span>}</Row>
+            <Row label="공급면적">{s.supplyMin !== null ? (s.supplyMin === s.supplyMax ? areaValueText(s.supplyMin, unit) : `${areaValueText(s.supplyMin, unit)} ~ ${areaValueText(s.supplyMax!, unit)}`) : <span className="text-muted">제공 정보 없음</span>}</Row>
             <Row label="총 세대수">{a.tot_suply_hshldco !== null ? `${a.tot_suply_hshldco.toLocaleString("ko-KR")}세대` : <Unknown />}</Row>
             <Row label="사업주체">{a.bsns_mby_nm ?? <Unknown />}</Row>
             <Row label="문의">{a.mdhs_telno ?? <Unknown />}</Row>
@@ -143,7 +143,7 @@ function DetailView() {
       <section className="rounded-xl bg-white p-5 shadow-sm">
         <div className="mb-2 flex items-center justify-between">
           <h2 className="text-base font-bold">주택형별 정보 ({types.length})</h2>
-          <span className="flex items-center gap-2 text-xs text-muted">전용면적 표시 <UnitToggle /></span>
+          <span className="flex items-center gap-2 text-xs text-muted">면적 표시 <UnitToggle /></span>
         </div>
         {types.length === 0 ? (
           <p className="text-sm"><Unknown>주택형 정보 없음</Unknown></p>
@@ -163,7 +163,7 @@ function DetailView() {
                     <tr key={t.id} className="border-b border-line align-top last:border-b-0">
                       <td className="py-2 pr-3 font-medium">{t.house_ty}</td>
                       <td className="pr-3">{ex !== null ? `전용 ${areaValueText(ex, unit)}` : <Unknown>확인 필요</Unknown>}</td>
-                      <td className="pr-3">{su !== null ? formatSqm(su) : <span className="text-muted">—</span>}</td>
+                      <td className="pr-3">{su !== null ? areaValueText(su, unit) : <span className="text-muted">—</span>}</td>
                       <td className="pr-3">
                         {t.general_supply_count ?? "—"} / {t.special_supply_count ?? "—"}
                         {t.housing_type_special_supply.length > 0 && (

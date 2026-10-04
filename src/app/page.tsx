@@ -100,7 +100,7 @@ export default function BrowsePage() {
         {chips.length > 0 && (
           <div className="mt-3 flex flex-wrap items-center gap-2" aria-label="적용 중인 조건">
             {chips.map((c) => <Badge key={c} tone="mint">{c}</Badge>)}
-            <span className="ml-1 inline-flex items-center gap-2 text-xs text-muted">전용면적 기준 <UnitToggle /></span>
+            <span className="ml-1 inline-flex items-center gap-2 text-xs text-muted">면적 표시 <UnitToggle /></span>
           </div>
         )}
       </section>

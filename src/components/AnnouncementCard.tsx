@@ -5,7 +5,6 @@ import { safeOfficialUrl } from "@/lib/links";
 import { formatKrw } from "@/lib/money";
 import { FAMILY_LABEL, phaseLabel, subtypeLabel } from "@/lib/labels";
 import { kstDateOf, summarizeHousing, unknownReasons } from "@/lib/summary";
-import { formatSqm } from "@/lib/units";
 import type { FeedRow } from "@/lib/feed";
 import type { Filters } from "@/lib/types";
 import { BookmarkButton } from "./AccountUI";
@@ -27,7 +26,7 @@ export function AnnouncementCard({ row, filters }: { row: FeedRow; filters: Filt
   const s = summarizeHousing(pool);
   const reasons = match.verdict === "unknown" ? unknownReasons(a.cheongyak_housing_types, filters) : [];
   const exclusive = range(s.exclusiveMin, s.exclusiveMax, (n) => areaValueText(n, filters.areaUnit));
-  const supply = range(s.supplyMin, s.supplyMax, formatSqm);
+  const supply = range(s.supplyMin, s.supplyMax, (n) => areaValueText(n, filters.areaUnit)); // 공급면적도 선택한 표시 단위로(라벨은 '공급면적'으로 전용면적과 구분)
   const price = range(s.priceMin, s.priceMax, (n) => formatKrw(n) ?? "");
   const checked = kstDateOf(a.last_seen_at);
   const sub = subtypeLabel(a);

@@ -54,7 +54,7 @@ export function UnitToggle() {
   const unit = usePrefs((s) => s.filters.areaUnit);
   const setAreaUnit = usePrefs((s) => s.setAreaUnit);
   return (
-    <div role="group" aria-label="전용면적 표시 단위" className="inline-flex overflow-hidden rounded-md border border-line text-xs">
+    <div role="group" aria-label="면적 표시 단위" className="inline-flex overflow-hidden rounded-md border border-line text-xs">
       {(["sqm", "pyeong"] as const).map((u) => (
         <button
           key={u}
@@ -144,7 +144,7 @@ export function FilterPanel({ regions }: { regions: { code: string; name: string
           <AreaInput label="최대" sqm={filters.maxAreaSqm} unit={filters.areaUnit} onCommit={(v) => setFilters({ maxAreaSqm: v, maxAreaInclusive: true })} />
         </div>
         <p className="mt-2 text-xs leading-relaxed text-muted">
-          전용면적으로만 찾습니다. APT·잔여세대는 공급면적만 제공되어 전용면적을 알 수 없으므로 &lsquo;판정 미확인&rsquo;으로 나뉩니다. 1평 ≈ 3.305785㎡, 평 표시는 반올림 값이며 검색 기준은 ㎡입니다.
+          전용면적으로만 찾습니다. APT·잔여세대는 공급면적만 제공되어 전용면적을 알 수 없으므로 &lsquo;판정 미확인&rsquo;으로 나뉩니다. 1평 ≈ 3.305785㎡. ㎡/평 전환은 화면 표시(전용·공급면적, 공고 카드·상세)만 바꾸며, 평 표시는 반올림 값이고 검색 기준은 ㎡입니다.
         </p>
       </Section>
 
