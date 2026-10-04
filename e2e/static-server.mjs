@@ -1,4 +1,4 @@
-// out/ 정적 내보내기 결과를 제공하는 의존성 없는 서버(E2E 전용). 배포 환경(Firebase Hosting)의 정적 동작을 흉내 낸다:
+// out/ 정적 내보내기 결과를 제공하는 의존성 없는 서버(E2E와 로컬 실행 공용: npm start / npm run local). 배포 환경(Firebase Hosting)의 정적 동작을 흉내 낸다:
 // 경로가 /로 끝나면 index.html, 파일이 없으면 404.html. 캐시 헤더 없음(테스트 결정성).
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";

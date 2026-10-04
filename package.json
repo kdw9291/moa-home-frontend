@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "python -m http.server 3000 --bind 127.0.0.1 -d out",
+    "start": "node e2e/static-server.mjs 3000",
+    "local": "next build && node e2e/static-server.mjs 3000",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "next build && playwright test",
